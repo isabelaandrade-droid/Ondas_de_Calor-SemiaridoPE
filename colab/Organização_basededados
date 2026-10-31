@@ -1,0 +1,475 @@
+# Importar Módulos
+
+import os                       # manipula caminhos e lista pastas/arquivos.
+import re                       # detecta padrões em texto (cabeçalho INMET)
+import unicodedata
+import gc
+import numpy as np
+import pandas as pd             # biblioteca principal para ler, limpar e unir tabelas
+import pyarrow as pa            # bibliotecas para salvar tabelas em Parquet (rápido, compactado).
+import pyarrow.parquet as pq    # ''''
+from glob import glob
+from collections import defaultdict
+from google.colab import drive
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import pearsonr
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.linear_model import LinearRegression
+from sklearn.neighbors import KDTree
+from scipy.spatial import cKDTree
+from scipy.stats import linregress
+import scipy
+import folium
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from io import BytesIO
+import base64
+from scipy.stats import norm
+from pathlib import Path
+from sklearn.neighbors import BallTree
+from scipy.stats import linregress, kendalltau
+
+# Montar o drive
+drive.mount("/content/drive")
+
+BASE = "/content/drive/MyDrive/...."
+
+PASTAS = {
+    "GRADE": os.path.join(BASE, "GRADE AMOSTRAL"),
+    "ERA5": os.path.join(BASE, "ERA5 - TEMP. DO AR"),
+    "INMET": os.path.join(BASE, "INMET"),
+    "MICRO": os.path.join(BASE, "MICRO"),
+    "MUNI": os.path.join(BASE, "MUNI")
+}
+
+# Diretório de saída
+OUT = "/content//drive/MyDrive/...."
+os.makedirs(OUT, exist_ok=True)
+
+print(" Base:", BASE)
+print(" Saída:", OUT)
+
+# ==============================================================================
+# 2. FUNÇÕES AUXILIARES
+# ==============================================================================
+
+def padronizar_texto(txt):
+    """Remove acentos, põe em minúsculo e remove espaços extras."""
+    if pd.isna(txt):
+        return ""
+    txt = str(txt).strip().lower()
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("utf-8")
+    txt = " ".join(txt.split())
+    return txt
+
+def concatenar_csv_para_parquet(pasta_base, microrregiao, tipo):
+    arquivo_saida = os.path.join(OUT, f"{tipo}_{microrregiao}.parquet")
+
+    if os.path.exists(arquivo_saida):
+        print(f" {arquivo_saida} já existe — pulando.")
+        return None # Não precisa ler se não for usar agora
+
+    caminho_mr = os.path.join(pasta_base, microrregiao)
+    arquivos_csv = glob(os.path.join(caminho_mr,"**/*.csv"), recursive=True)
+
+    if not arquivos_csv:
+        print(f" Nenhum CSV encontrado em {caminho_mr}")
+        return None
+
+    dfs = []
+    for f in arquivos_csv:
+        try:
+            # engine='python' é mais lento, mas lida melhor com separadores ruins
+            df = pd.read_csv(f, sep=None, engine="python", encoding="latin1", encoding_errors="ignore")
+            dfs.append(df)
+            print(f"  ✔ {os.path.basename(f)} ({df.shape[0]} linhas)")
+        except Exception as e:
+            print(f" Erro ao ler {f}: {e}")
+
+    if not dfs:
+        return None
+
+    df_final = pd.concat(dfs, ignore_index=True)
+
+    # Salva em Parquet
+    df_final.to_parquet(arquivo_saida, index=False)
+    print(f" Salvo: {arquivo_saida} | Linhas: {df_final.shape[0]}")
+
+    # Limpa memória
+    del dfs, df_final
+    gc.collect()
+
+# ==============================================================================
+# 3. PROCESSAMENTO: GRADE E ERA5 (CONCATENAÇÃO)
+# ==============================================================================
+print("\n=== PROCESSANDO GRADE E ERA5 ===")
+for tipo in ["GRADE", "ERA5"]:
+    if os.path.exists(PASTAS[tipo]):
+        micros = sorted(os.listdir(PASTAS[tipo]))
+        for mr in micros:
+            concatenar_csv_para_parquet(PASTAS[tipo], mr, tipo)
+
+# ==============================================================================
+# 4. PROCESSAMENTO: INMET (CONSOLIDAÇÃO E LIMPEZA)
+# ==============================================================================
+print("\n=== PROCESSANDO INMET ===")
+
+arquivo_inmet_final = os.path.join(OUT, "INMET.parquet")
+
+# Só processa se ainda não existir (ou se quiser refazer, apague o arquivo antes)
+arquivos_inmet = glob(os.path.join(PASTAS["INMET"], "*.csv"))
+dfs_inmet = []
+
+for f in arquivos_inmet:
+    try:
+        # decimal="," é CRUCIAL para o INMET
+        df = pd.read_csv(f, sep=None, engine="python", encoding="latin1",
+                         encoding_errors="ignore", decimal=",")
+        dfs_inmet.append(df)
+    except Exception as e:
+        print(f" Erro ao ler {f}: {e}")
+
+if dfs_inmet:
+    df_inmet = pd.concat(dfs_inmet, ignore_index=True)
+
+    # --- LIMPEZA DE TIPOS INMET ---
+    for col in df_inmet.columns:
+        # Se for objeto (texto), tenta virar número primeiro
+        if df_inmet[col].dtype == "object":
+            # errors='coerce' transforma "falha" em NaN (vazio), garantindo que a coluna vire numérica
+            df_inmet[col] = pd.to_numeric(df_inmet[col], errors='coerce')
+
+        # Se após tentar virar número ainda sobrar texto/vazio misturado:
+        if df_inmet[col].dtype == "object":
+             df_inmet[col] = df_inmet[col].astype(str).replace('nan', None)
+
+    # --- PADRONIZAÇÃO DE TEXTO E COLUNAS ---
+    df_inmet.columns = [padronizar_texto(c) for c in df_inmet.columns]
+
+    # Aplica padronização apenas nas colunas que sobraram como TEXTO (para não estragar números)
+    colunas_texto = df_inmet.select_dtypes(include=['object']).columns
+    df_inmet[colunas_texto] = df_inmet[colunas_texto].applymap(padronizar_texto)
+
+    # Renomear
+    renomear = {}
+    for c in df_inmet.columns:
+        if "temperatura" in c and "max" in c: renomear[c] = "tmax"
+        elif "temperatura" in c and "min" in c: renomear[c] = "tmin"
+        elif "nome" in c or "municipio" in c: renomear[c] = "municipio"
+        elif "data" in c: renomear[c] = "data"
+
+    df_inmet = df_inmet.rename(columns=renomear)
+
+    # Data
+    if "data" in df_inmet.columns:
+        df_inmet["data"] = pd.to_datetime(df_inmet["data"], dayfirst=True, errors="coerce")
+
+    # Salva
+    df_inmet.to_parquet(arquivo_inmet_final, index=False)
+    print(f" INMET Consolidado salvo: {df_inmet.shape[0]} linhas")
+
+    del df_inmet, dfs_inmet
+    gc.collect()
+
+# ==============================================================================
+# 5. PADRONIZAÇÃO FINAL: ERA5 E GRADE
+# ==============================================================================
+print("\n=== PADRONIZANDO ERA5 E GRADE JÁ SALVOS ===")
+
+# Pegar todos os parquets gerados (exceto INMET)
+arquivos_para_padronizar = glob(os.path.join(OUT, "ERA5_*.parquet")) + glob(os.path.join(OUT, "GRADE_*.parquet"))
+
+for arquivo in arquivos_para_padronizar:
+    try:
+        df = pd.read_parquet(arquivo)
+
+        # Verifica se já foi padronizado (para ganhar tempo)
+        if "__padronizado__" in df.columns:
+            print(f" {os.path.basename(arquivo)} já padronizado.")
+            continue
+
+        # Padroniza Colunas
+        df.columns = [padronizar_texto(c) for c in df.columns]
+
+        # Padroniza Conteúdo (Apenas Strings)
+        cols_str = df.select_dtypes(include=['object']).columns
+        if len(cols_str) > 0:
+            df[cols_str] = df[cols_str].applymap(padronizar_texto)
+
+        # Renomeia
+        renomear = {}
+        for c in df.columns:
+            if ("temperatura" in c and "max" in c) or c=="tmax_c": renomear[c] = "tmax"
+            elif ("temperatura" in c and "min" in c) or c=="tmin_c": renomear[c] = "tmin"
+            elif any(x in c for x in ["municipio", "estacao", "cidade"]): renomear[c] = "municipio"
+            elif "ano" in c: renomear[c] = "ano"
+            elif "mes" in c: renomear[c] = "mes"
+            elif "dia" in c: renomear[c] = "dia"
+
+        df = df.rename(columns=renomear)
+
+        # Data
+        if all(col in df.columns for col in ["dia", "mes", "ano"]):
+            df["data"] = pd.to_datetime(
+                df["ano"].astype(str) + "-" +
+                df["mes"].astype(str).str.zfill(2) + "-" +
+                df["dia"].astype(str).str.zfill(2),
+                errors="coerce"
+            )
+
+        # Marca como pronto e salva
+        df["__padronizado__"] = True
+        df.to_parquet(arquivo, index=False)
+        print(f" Atualizado: {os.path.basename(arquivo)}")
+
+        del df
+        gc.collect()
+
+    except Exception as e:
+        print(f" Erro ao padronizar {os.path.basename(arquivo)}: {e}")
+
+print("\n Processamento Concluído! Todos os dados estão na pasta PARQUET.")
+
+import pandas as pd
+import numpy as np
+import os
+import unicodedata
+import gc
+from glob import glob
+
+# ==============================================================================
+# CONFIGURAÇÕES E FUNÇÕES
+# ==============================================================================
+print("=== REPROCESSANDO INMET (COM LAT/LON) ===")
+
+arquivo_inmet_final = os.path.join(OUT, "INMET.parquet")
+
+if os.path.exists(arquivo_inmet_final):
+    os.remove(arquivo_inmet_final)
+    print("🗑 Arquivo INMET.parquet antigo foi deletado.")
+
+def padronizar_cabecalho(txt):
+    """Limpa o nome das colunas"""
+    if pd.isna(txt): return ""
+    txt = str(txt).strip().lower()
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("utf-8")
+    return txt.replace(" ", "_").replace(".", "")
+
+# ==============================================================================
+# 2. LER E PROCESSAR CSVs
+# ==============================================================================
+arquivos_inmet = glob(os.path.join(PASTAS["INMET"], "*.csv"))
+dfs_inmet = []
+
+print(f" Lendo {len(arquivos_inmet)} arquivos CSV do INMET...")
+
+for f in arquivos_inmet:
+    try:
+        df = pd.read_csv(f, sep=None, engine="python", encoding="latin1",
+                         encoding_errors="ignore", decimal=",")
+
+        # 1. Limpa cabeçalho
+        df.columns = [padronizar_cabecalho(c) for c in df.columns]
+
+        # 2. Renomear (INCLUINDO LAT/LON AGORA)
+        renomear = {}
+        for c in df.columns:
+            if "temperatura" in c and "max" in c: renomear[c] = "tmax"
+            elif "temperatura" in c and "min" in c: renomear[c] = "tmin"
+            elif any(x in c for x in ["nome", "estacao", "municipio", "cidade"]): renomear[c] = "municipio"
+            elif "data" in c: renomear[c] = "data"
+            # ADICIONADO AQUI:
+            elif "latitude" in c: renomear[c] = "latitude"
+            elif "longitude" in c: renomear[c] = "longitude"
+            elif "elevation" in c or "altitude" in c: renomear[c] = "altitude"
+
+        df = df.rename(columns=renomear)
+
+        # 3. Filtra colunas úteis (AGORA COM LAT/LON)
+        cols_desejadas = ["municipio", "data", "tmax", "tmin", "latitude", "longitude", "altitude"]
+        cols_existentes = [c for c in df.columns if c in cols_desejadas]
+
+        df = df[cols_existentes]
+
+        dfs_inmet.append(df)
+
+    except Exception as e:
+        print(f"⚠ Erro ao ler {os.path.basename(f)}: {e}")
+
+if not dfs_inmet:
+    raise ValueError("Nenhum CSV do INMET foi carregado!")
+
+# Junta tudo
+df_inmet = pd.concat(dfs_inmet, ignore_index=True)
+
+# ==============================================================================
+# 3. LIMPEZA DE DADOS
+# ==============================================================================
+
+# --- A. CORREÇÃO DE DUPLICIDADE (IGUAL ANTES) ---
+df_inmet = df_inmet.loc[:, ~df_inmet.columns.duplicated()]
+
+# --- B. LIMPAR MUNICÍPIO ---
+df_inmet["municipio"] = df_inmet["municipio"].astype(str).str.lower().str.strip()
+df_inmet["municipio"] = df_inmet["municipio"].apply(
+    lambda x: unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("utf-8") if isinstance(x, str) else x
+)
+
+# --- C. LIMPAR DATA ---
+df_inmet["data"] = pd.to_datetime(df_inmet["data"], dayfirst=True, errors="coerce")
+
+# --- D. LIMPAR NÚMEROS (AGORA INCLUI LAT/LON) ---
+# O INMET costuma usar vírgula em latitude também (ex: -8,5)
+cols_numericas = ["tmax", "tmin", "latitude", "longitude", "altitude"]
+
+for col in cols_numericas:
+    if col in df_inmet.columns:
+        if df_inmet[col].dtype == "object":
+             df_inmet[col] = df_inmet[col].astype(str).str.replace(",", ".")
+        df_inmet[col] = pd.to_numeric(df_inmet[col], errors="coerce")
+
+# Remove vazios essenciais
+df_inmet = df_inmet.dropna(subset=["data", "municipio"])
+
+# ==============================================================================
+# 4. SALVAR E CONFERIR
+# ==============================================================================
+df_inmet.to_parquet(arquivo_inmet_final, index=False)
+
+print(f"\n INMET REPROCESSADO (COM GEOMETRIA)!")
+print("Colunas finais:", df_inmet.columns.tolist())
+print("\nAmostra de Coordenadas:")
+if "latitude" in df_inmet.columns:
+    print(df_inmet[["municipio", "latitude", "longitude"]].head())
+else:
+    print(" ALERTA: Colunas de latitude/longitude ainda não foram encontradas no CSV original.")
+
+# ==========================================================
+# SCRIPT DE CONFERÊNCIA (PROVA REAL)
+# ==========================================================
+import pandas as pd
+from glob import glob
+import os
+
+print("=== CONFERÊNCIA DE INTEGRIDADE ===")
+
+# Pasta teste
+pasta_origem = PASTAS["INMET"]
+arquivo_destino = os.path.join(OUT, "INMET.parquet")
+
+# 1. Contar linhas nos CSVs originais
+csvs = glob(os.path.join(pasta_origem, "*.csv"))
+total_linhas_csv = 0
+print(f"Somando linhas de {len(csvs)} arquivos CSV... (aguarde)")
+
+for f in csvs:
+    try:
+        # Lê apenas para contar (usecols=[0] economiza memória)
+        df_temp = pd.read_csv(f, sep=None, engine="python", encoding="latin1", encoding_errors="ignore")
+        total_linhas_csv += len(df_temp)
+    except:
+        pass # Se arquivo estiver corrompido, não conta
+
+# 2. Contar linhas no Parquet gerado
+df_parquet = pd.read_parquet(arquivo_destino)
+total_linhas_parquet = len(df_parquet)
+
+print("-" * 30)
+print(f"📄 Linhas nos CSVs originais:  {total_linhas_csv:,}")
+print(f"📦 Linhas no Parquet final:    {total_linhas_parquet:,}")
+print("-" * 30)
+
+diferenca = total_linhas_csv - total_linhas_parquet
+
+if diferenca == 0:
+    print("✅ SUCESSO TOTAL: Nenhuma linha foi perdida!")
+elif diferenca > 0:
+    print(f"⚠ Atenção: {diferenca} linhas a menos. Verifique se algum CSV estava vazio ou corrompido.")
+else:
+    print("Estranho: Tem mais linhas no final do que no começo (duplicidade?).")
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plotar_mapa_rapido(caminho_parquet, titulo):
+    # Lê o arquivo
+    df = pd.read_parquet(caminho_parquet)
+
+    # Tenta adivinhar os nomes das colunas de lat/lon (caso variem)
+    cols = df.columns
+    col_lat = next((c for c in cols if 'lat' in c), None)
+    col_lon = next((c for c in cols if 'lon' in c), None)
+
+    if not col_lat or not col_lon:
+        print(f"⚠ Não encontrei colunas de Latitude/Longitude em {titulo}")
+        return
+
+    # Plota
+    plt.figure(figsize=(10, 10))
+
+    # Scatter plot: Longitude no X, Latitude no Y
+    # alpha=0.5 ajuda a ver densidade (pontos sobrepostos ficam mais escuros)
+    plt.scatter(df[col_lon], df[col_lat], s=1, alpha=0.5, c='blue')
+
+    plt.title(f"Distribuição Espacial: {titulo}")
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.grid(True, linestyle='--', alpha=0.3)
+
+    # Garante que a proporção do mapa não fique distorcida (esticada)
+    plt.gca().set_aspect('equal', adjustable='box')
+
+    plt.show()
+    print(f"Total de pontos plotados: {len(df)}")
+
+# --- TESTE COM UM ARQUIVO DE CADA TIPO ---
+
+# 1. Testar INMET
+arquivo_inmet = os.path.join(OUT, "INMET.parquet")
+plotar_mapa_rapido(arquivo_inmet, "Estações INMET")
+
+# 2. Testar um arquivo da GRADE (pega o primeiro que encontrar)
+grades = glob(os.path.join(OUT, "GRADE_*.parquet"))
+if grades:
+    plotar_mapa_rapido(grades[0], "Amostra da GRADE")
+
+
+import folium
+from folium.plugins import FastMarkerCluster
+
+def mapa_interativo(caminho_parquet):
+    df = pd.read_parquet(caminho_parquet)
+
+    # Pega lat/lon
+    col_lat = next((c for c in df.columns if 'lat' in c), None)
+    col_lon = next((c for c in df.columns if 'lon' in c), None)
+
+    if not col_lat: return
+
+    # Remove erros de lat/lon vazios antes de plotar
+    df = df.dropna(subset=[col_lat, col_lon])
+
+    # Cria o mapa centralizado na média dos pontos
+    centro_lat = df[col_lat].mean()
+    centro_lon = df[col_lon].mean()
+    m = folium.Map(location=[centro_lat, centro_lon], zoom_start=6)
+
+    # Se forem MUITOS pontos (> 5000), usamos Cluster para não travar o navegador
+    # Se forem poucos, plotamos círculos individuais
+    if len(df) > 5000:
+        print("Muitos pontos detectados. Usando clusterização...")
+        dados_lat_lon = list(zip(df[col_lat], df[col_lon]))
+        FastMarkerCluster(dados_lat_lon).add_to(m)
+    else:
+        for _, row in df.iterrows():
+            folium.CircleMarker(
+                location=[row[col_lat], row[col_lon]],
+                radius=3,
+                color='red',
+                fill=True
+            ).add_to(m)
+
+    return m
