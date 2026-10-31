@@ -1,0 +1,757 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# ==============================================================================
+# 1. CONFIGURAÇÕES
+# ==============================================================================
+BASE_DIR = Path("/content/drive/MyDrive/....../SAIDA_FINAL")
+
+# Caminhos das pastas geradas nos passos anteriores
+DIR_LST = BASE_DIR / "MAPAS_RESUMO"
+DIR_TAR = BASE_DIR / "MAPAS_RESUMO_ERA5"
+DIR_COMB = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+
+OUT_TABELA = BASE_DIR / "TABELA_FINAL"
+OUT_TABELA.mkdir(exist_ok=True)
+
+print(" Iniciando cálculo das estatísticas globais...")
+
+# ==============================================================================
+# 2. FUNÇÃO CALCULADORA
+# ==============================================================================
+def calcular_metricas(diretorio, tipo_dado):
+    """
+    Lê todos os parquets do diretório (e subdiretórios) e calcula médias ponderadas.
+    """
+    # --- CORREÇÃO AQUI: USAR rglob PARA ENTRAR NAS SUBPASTAS ---
+    arquivos = list(diretorio.rglob("*.parquet"))
+
+    if not arquivos:
+        print(f" Nenhum arquivo encontrado em {diretorio.name}")
+        return None
+
+    print(f"    Lendo {len(arquivos)} arquivos de {tipo_dado}...", end=" ")
+
+    # Define quais colunas buscar dependendo do tipo de dado
+    if tipo_dado == "Acoplado (LST+Tar)":
+        cols = ['freq_eventos', 'duracao_media', 'intensidade_lst_media', 'intensidade_ar_media', 'magnitude_lst_total', 'magnitude_ar_total']
+        col_freq = 'freq_eventos'
+    else: # LST ou ERA5
+        cols = ['num_eventos', 'total_dias_onda', 'intensidade_media', 'intensidade_acumulada']
+        col_freq = 'num_eventos'
+
+    try:
+        df = pd.concat([pd.read_parquet(f, columns=cols) for f in arquivos], ignore_index=True)
+    except Exception as e:
+        print(f"\n   Erro ao ler arquivos: {e}")
+        return None
+
+    # --- CÁLCULOS ---
+    total_eventos = df[col_freq].sum()
+
+    if total_eventos == 0:
+        print(" (Total de eventos = 0)")
+        return None
+
+    stats = {
+        "Tipo de Evento": tipo_dado,
+        "Frequência Total (Eventos)": total_eventos,
+    }
+
+    # Lógica condicional para cálculo das médias
+    if tipo_dado == "Acoplado (LST+Tar)":
+        # Média ponderada pela frequência dos eventos
+        stats["Duração Média (dias)"] = np.average(df['duracao_media'], weights=df[col_freq])
+
+        # Intensidade
+        int_lst = np.average(df['intensidade_lst_media'], weights=df[col_freq])
+        int_ar = np.average(df['intensidade_ar_media'], weights=df[col_freq])
+        stats["Intensidade Média (°C)"] = f"LST: {int_lst:.2f} | Ar: {int_ar:.2f}"
+
+        # Magnitude
+        mag_lst = df['magnitude_lst_total'].sum() / total_eventos
+        mag_ar = df['magnitude_ar_total'].sum() / total_eventos
+        stats["Magnitude Média"] = f"LST: {mag_lst:.2f} | Ar: {mag_ar:.2f}"
+
+    else:
+        # Para LST e ERA5 (Isolados)
+        stats["Duração Média (dias)"] = df['total_dias_onda'].sum() / total_eventos
+
+        # Intensidade Média (ponderada)
+        mask = df['intensidade_media'] > 0
+        if mask.any() and df.loc[mask, col_freq].sum() > 0:
+            stats["Intensidade Média (°C)"] = np.average(df.loc[mask, 'intensidade_media'], weights=df.loc[mask, col_freq])
+        else:
+            stats["Intensidade Média (°C)"] = 0
+
+        # Magnitude Média
+        stats["Magnitude Média"] = df['intensidade_acumulada'].sum() / total_eventos
+
+    print("Calculado.")
+    return stats
+
+# ==============================================================================
+# 3. EXECUÇÃO E FORMATAÇÃO
+# ==============================================================================
+resumo_final = []
+
+# Processa cada tipo
+resumo_final.append(calcular_metricas(DIR_LST, "LST (Satélite)"))
+resumo_final.append(calcular_metricas(DIR_TAR, "ERA5 (Ar)"))
+resumo_final.append(calcular_metricas(DIR_COMB, "Acoplado (LST+Tar)"))
+
+# Remove Nones
+resumo_final = [x for x in resumo_final if x is not None]
+
+# ==============================================================================
+# 4. SALVAR
+# ==============================================================================
+if resumo_final:
+    # Cria DataFrame
+    df_tabela = pd.DataFrame(resumo_final)
+
+    # Reorganiza colunas
+    cols_order = ["Tipo de Evento", "Frequência Total (Eventos)", "Duração Média (dias)", "Intensidade Média (°C)", "Magnitude Média"]
+
+    # Garante que as colunas existam antes de selecionar
+    cols_presentes = [c for c in cols_order if c in df_tabela.columns]
+    df_exibicao = df_tabela[cols_presentes].copy()
+
+    print("\n" + "="*80)
+    print("TABELA RESUMO DE ONDAS DE CALOR")
+    print("="*80)
+
+    # Formata para exibir bonito no terminal
+    pd.options.display.float_format = '{:,.2f}'.format
+    print(df_exibicao.to_string(index=False))
+
+    # Salva CSV Limpo
+    caminho_csv = OUT_TABELA / "Tabela_Resumo_Artigo.csv"
+    df_exibicao.to_csv(caminho_csv, index=False)
+
+    # Salva Excel
+    caminho_xls = OUT_TABELA / "Dados_Completos_Analise.xlsx"
+    df_tabela.to_excel(caminho_xls, index=False)
+
+    print(f"\n Arquivos salvos em: {OUT_TABELA}")
+else:
+    print("\n ERRO CRÍTICO: Não foi possível calcular métricas para nenhum tipo de dado.")
+    print("   Verifique se as pastas MAPAS_RESUMO e METRICAS_ACOPLAMENTO_FINAL contêm subpastas com arquivos .parquet.")
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import gc
+import numpy as np
+
+# ==============================================================================
+# 1. CONFIGURAÇÕES
+# ==============================================================================
+BASE_DIR = Path("/content/drive/MyDrive/..... /SAIDA_FINAL")
+
+# Pastas de Origem
+DIR_LST = BASE_DIR / "MAPAS_RESUMO"
+DIR_TAR = BASE_DIR / "MAPAS_RESUMO_ERA5"
+DIR_COMB = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+
+# Pasta para Salvar
+OUT_MAPAS_IMG = BASE_DIR / "IMAGENS_MAPAS_FINAL"
+OUT_MAPAS_IMG.mkdir(parents=True, exist_ok=True)
+
+print(f" Preparando gerador de mapas (Estilo Visual Ajustado)...")
+
+# ==============================================================================
+# 2. FUNÇÃO DE CONSOLIDAÇÃO (Mantida a lógica, ajuste leve)
+# ==============================================================================
+def consolidar_dados_espaciais(diretorio, tipo_dado):
+    print(f"\n Processando dados de: {tipo_dado}...")
+
+    arquivos = list(diretorio.rglob("*.parquet"))
+
+    if not arquivos:
+        print(f"   Nenhum arquivo encontrado.")
+        return None
+
+    # Define colunas
+    if tipo_dado == "ACOPLADO":
+        cols = ['latitude', 'longitude', 'freq_eventos', 'dias_sob_onda', 'magnitude_lst_total']
+        c_freq, c_dias, c_mag = 'freq_eventos', 'dias_sob_onda', 'magnitude_lst_total'
+    else:
+        cols = ['latitude', 'longitude', 'num_eventos', 'total_dias_onda', 'intensidade_acumulada']
+        c_freq, c_dias, c_mag = 'num_eventos', 'total_dias_onda', 'intensidade_acumulada'
+
+    dfs = []
+    for f in arquivos:
+        try:
+            dfs.append(pd.read_parquet(f, columns=cols))
+        except: continue
+
+    if not dfs: return None
+
+    df_bruto = pd.concat(dfs, ignore_index=True)
+
+    # Agrupa por pixel (Lat/Lon)
+    df_pixel = df_bruto.groupby(['latitude', 'longitude']).sum().reset_index()
+
+    # Calcula Métricas
+    df_pixel['Frequencia'] = df_pixel[c_freq]
+    # Evita divisão por zero
+    df_pixel['Duracao'] = df_pixel[c_dias] / df_pixel[c_freq].replace(0, 1)
+    df_pixel['Magnitude'] = df_pixel[c_mag] / df_pixel[c_freq].replace(0, 1) # Magnitude média por evento
+
+    # Filtra onde não teve evento
+    df_final = df_pixel[df_pixel['Frequencia'] > 0].copy()
+
+    return df_final[['latitude', 'longitude', 'Frequencia', 'Duracao', 'Magnitude']]
+
+# ==============================================================================
+# 3. FUNÇÃO DE PLOTAGEM (AJUSTADA: Cores e Títulos)
+# ==============================================================================
+def plotar_mapa_bonito(df, coluna, titulo_grafico, label_legenda, cmap, arquivo_saida):
+    if df is None or df.empty: return
+
+    plt.figure(figsize=(10, 8))
+
+    # --- MELHORIA DE CONTRASTE ---
+    # Calcula o percentil 98% para definir o "Maximo Visual".
+    # Isso evita que um único pixel extremo deixe o mapa todo branco.
+    vmax = df[coluna].quantile(0.98)
+
+    # Scatter plot
+    sc = plt.scatter(df['longitude'], df['latitude'],
+                     c=df[coluna],
+                     cmap=cmap,
+                     s=1.5,           # Pontos levemente maiores para preencher
+                     marker='s',      # Quadrado (square) preenche melhor que bola
+                     alpha=1.0,
+                     vmin=0,          # Garante que o branco comece no 0
+                     vmax=vmax)       # Teto visual para contraste
+
+    # Barra de Cores
+    cbar = plt.colorbar(sc, fraction=0.03, pad=0.04)
+    cbar.set_label(label_legenda, size=12)
+
+    # Títulos e Eixos
+    plt.title(titulo_grafico, fontsize=15, fontweight='bold', pad=15)
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.axis('equal') # Mantém a proporção do mapa correta
+
+    # Remove bordas desnecessárias do gráfico (estilo "clean")
+    sns.despine()
+
+    # Salva
+    plt.savefig(OUT_MAPAS_IMG / arquivo_saida, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"   Mapa salvo: {arquivo_saida}")
+
+# ==============================================================================
+# 4. EXECUÇÃO
+# ==============================================================================
+
+# Configuração das tarefas
+# Estrutura: (Pasta, Nome_Dado, Titulo_Base)
+tarefas = [
+    (DIR_LST,  "LST",      "Temperatura da Superfície (LST)"),
+    (DIR_TAR,  "ERA5",     "Temperatura do Ar (ERA5)"),
+    (DIR_COMB, "ACOPLADO", "Eventos Acoplados (LST+Ar)")
+]
+
+for diretorio, nome_dado, titulo_base in tarefas:
+
+    # 1. Processar
+    df_geo = consolidar_dados_espaciais(diretorio, nome_dado)
+
+    if df_geo is not None:
+        # 2. Gerar Mapas com as Cores Pedidas
+
+        # --- FREQUÊNCIA (Branco -> Vermelho) ---
+        plotar_mapa_bonito(
+            df_geo,
+            coluna='Frequencia',
+            titulo_grafico=f"Frequência de Ondas de Calor - {titulo_base}",
+            label_legenda="Número Total de Eventos",
+            cmap="Reds",
+            arquivo_saida=f"Mapa_{nome_dado}_Frequencia.png"
+        )
+
+        # --- DURAÇÃO (Branco -> Marrom/Laranja) ---
+        # 'YlOrBr' é excelente para representar "seca" ou duração
+        plotar_mapa_bonito(
+            df_geo,
+            coluna='Duracao',
+            titulo_grafico=f"Duração Média dos Eventos - {titulo_base}",
+            label_legenda="Duração Média (Dias)",
+            cmap="YlOrBr",
+            arquivo_saida=f"Mapa_{nome_dado}_Duracao.png"
+        )
+
+        # --- MAGNITUDE (Branco -> Roxo) ---
+        plotar_mapa_bonito(
+            df_geo,
+            coluna='Magnitude',
+            titulo_grafico=f"Magnitude Média (Severidade) - {titulo_base}",
+            label_legenda="Magnitude (°C acumulados / dia)",
+            cmap="Purples",
+            arquivo_saida=f"Mapa_{nome_dado}_Magnitude.png"
+        )
+
+        # Salva CSV
+        df_geo.to_csv(OUT_MAPAS_IMG / f"DADOS_GEO_{nome_dado}.csv", index=False)
+
+        del df_geo
+        gc.collect()
+
+print("\n Mapas gerados com sucesso!")
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import gc
+import numpy as np
+
+# ==============================================================================
+# 1. CONFIGURAÇÕES
+# ==============================================================================
+BASE_DIR = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+
+# Pastas de Origem
+DIR_LST = BASE_DIR / "MAPAS_RESUMO"
+DIR_TAR = BASE_DIR / "MAPAS_RESUMO_ERA5"
+DIR_COMB = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+
+# Pasta para Salvar
+OUT_MAPAS_IMG = BASE_DIR / "MAPAS_CALOR_INGLES"
+OUT_MAPAS_IMG.mkdir(parents=True, exist_ok=True)
+
+print(f" Preparando gerador de mapas (Estilo Visual Ajustado)...")
+
+# ==============================================================================
+# 2. FUNÇÃO DE CONSOLIDAÇÃO (Mantida a lógica, ajuste leve)
+# ==============================================================================
+def consolidar_dados_espaciais(diretorio, tipo_dado):
+    print(f"\n🔄 Processando dados de: {tipo_dado}...")
+
+    arquivos = list(diretorio.rglob("*.parquet"))
+
+    if not arquivos:
+        print(f"   ❌ Nenhum arquivo encontrado.")
+        return None
+
+    # Define colunas
+    if tipo_dado == "ACOPLADO":
+        cols = ['latitude', 'longitude', 'freq_eventos', 'dias_sob_onda', 'magnitude_lst_total']
+        c_freq, c_dias, c_mag = 'freq_eventos', 'dias_sob_onda', 'magnitude_lst_total'
+    else:
+        cols = ['latitude', 'longitude', 'num_eventos', 'total_dias_onda', 'intensidade_acumulada']
+        c_freq, c_dias, c_mag = 'num_eventos', 'total_dias_onda', 'intensidade_acumulada'
+
+    dfs = []
+    for f in arquivos:
+        try:
+            dfs.append(pd.read_parquet(f, columns=cols))
+        except: continue
+
+    if not dfs: return None
+
+    df_bruto = pd.concat(dfs, ignore_index=True)
+
+    # Agrupa por pixel (Lat/Lon)
+    df_pixel = df_bruto.groupby(['latitude', 'longitude']).sum().reset_index()
+
+    # Calcula Métricas
+    df_pixel['Frequencia'] = df_pixel[c_freq]
+    # Evita divisão por zero
+    df_pixel['Duracao'] = df_pixel[c_dias] / df_pixel[c_freq].replace(0, 1)
+    df_pixel['Magnitude'] = df_pixel[c_mag] / df_pixel[c_freq].replace(0, 1) # Magnitude média por evento
+
+    # Filtra onde não teve evento
+    df_final = df_pixel[df_pixel['Frequencia'] > 0].copy()
+
+    return df_final[['latitude', 'longitude', 'Frequencia', 'Duracao', 'Magnitude']]
+
+# ==============================================================================
+# 3. FUNÇÃO DE PLOTAGEM (AJUSTADA: Cores e Títulos)
+# ==============================================================================
+
+def plotar_mapa_bonito(
+        df,
+        coluna,
+        titulo_grafico,
+        label_legenda,
+        cmap,
+        arquivo_saida,
+        painel=None):
+
+    if df is None or df.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Limite superior para melhorar o contraste
+    vmax = df[coluna].quantile(0.98)
+
+    # Mapa
+    sc = ax.scatter(
+        df["longitude"],
+        df["latitude"],
+        c=df[coluna],
+        cmap=cmap,
+        s=1.5,
+        marker="s",
+        alpha=1.0,
+        vmin=0,
+        vmax=vmax
+    )
+
+    # Barra de cores
+    cbar = plt.colorbar(
+        sc,
+        ax=ax,
+        fraction=0.03,
+        pad=0.04
+    )
+
+    cbar.set_label(
+        label_legenda,
+        fontsize=12,
+        fontweight="bold"
+    )
+
+    cbar.ax.tick_params(labelsize=11)
+
+    # Painel (a), (b), (c)
+    if painel is not None:
+
+        ax.text(
+            0.02,
+            0.98,
+            painel,
+            transform=ax.transAxes,
+            fontsize=20,
+            fontweight="bold",
+            ha="left",
+            va="top"
+        )
+
+    # Título (opcional)
+    if titulo_grafico != "":
+        ax.set_title(
+            titulo_grafico,
+            fontsize=16,
+            fontweight="bold",
+            pad=15
+        )
+
+    # Eixos
+    ax.set_xlabel(
+        "Longitude (°)",
+        fontsize=12
+    )
+
+    ax.set_ylabel(
+        "Latitude (°)",
+        fontsize=12
+    )
+
+    ax.set_aspect("equal")
+
+    sns.despine()
+
+    plt.savefig(
+        OUT_MAPAS_IMG / arquivo_saida,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    print(f"   Mapa salvo: {arquivo_saida}")
+
+# ==============================================================================
+# 4. EXECUÇÃO - MAPAS DE FREQUÊNCIA DAS ONDAS DE CALOR
+# ==============================================================================
+
+# ==============================================================================
+# 4. EXECUÇÃO
+# ==============================================================================
+
+tarefas = [
+
+    (
+        DIR_LST,
+        "LST",
+        "Number of Events (LST)",
+        "(a)"
+    ),
+
+    (
+        DIR_TAR,
+        "ERA5",
+        "Number of Events (Air Temperature)",
+        "(b)"
+    ),
+
+    (
+        DIR_COMB,
+        "ACOPLADO",
+        "Number of Coupled Events",
+        "(c)"
+    )
+]
+
+for diretorio, nome_dado, legenda, painel in tarefas:
+
+    print(f"\n Processing {nome_dado}...")
+
+    df_geo = consolidar_dados_espaciais(
+        diretorio,
+        nome_dado
+    )
+
+    if df_geo is None or df_geo.empty:
+        print(f" No data found for {nome_dado}.")
+        continue
+
+    plotar_mapa_bonito(
+        df=df_geo,
+        coluna="Frequencia",
+        titulo_grafico="",
+        label_legenda=legenda,
+        cmap="Reds",
+        arquivo_saida=f"Figure_HeatWaveFrequency_{nome_dado}.png",
+        painel=painel
+    )
+
+    del df_geo
+    gc.collect()
+
+print("\n Heat wave frequency maps successfully generated!")
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import gc
+import numpy as np
+
+# ==============================================================================
+# 1. CONFIGURAÇÕES
+# ==============================================================================
+BASE_DIR = Path("/content/drive/MyDrive/.... /SAIDA_FINAL")
+
+# Pastas de Origem
+DIR_LST = BASE_DIR / "MAPAS_RESUMO"
+DIR_TAR = BASE_DIR / "MAPAS_RESUMO_ERA5"
+DIR_COMB = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+
+# Pasta para Salvar
+OUT_MAPAS_IMG = BASE_DIR / "MAPAS_CALOR_INGLES"
+OUT_MAPAS_IMG.mkdir(parents=True, exist_ok=True)
+
+print(f" Preparando gerador de mapas (Estilo Visual Ajustado)...")
+
+# ==============================================================================
+# 2. FUNÇÃO DE CONSOLIDAÇÃO (Mantida a lógica, ajuste leve)
+# ==============================================================================
+def consolidar_dados_espaciais(diretorio, tipo_dado):
+    print(f"\n Processando dados de: {tipo_dado}...")
+
+    arquivos = list(diretorio.rglob("*.parquet"))
+
+    if not arquivos:
+        print(f"  Nenhum arquivo encontrado.")
+        return None
+
+    # Define colunas
+    if tipo_dado == "ACOPLADO":
+        cols = ['latitude', 'longitude', 'freq_eventos', 'dias_sob_onda', 'magnitude_lst_total']
+        c_freq, c_dias, c_mag = 'freq_eventos', 'dias_sob_onda', 'magnitude_lst_total'
+    else:
+        cols = ['latitude', 'longitude', 'num_eventos', 'total_dias_onda', 'intensidade_acumulada']
+        c_freq, c_dias, c_mag = 'num_eventos', 'total_dias_onda', 'intensidade_acumulada'
+
+    dfs = []
+    for f in arquivos:
+        try:
+            dfs.append(pd.read_parquet(f, columns=cols))
+        except: continue
+
+    if not dfs: return None
+
+    df_bruto = pd.concat(dfs, ignore_index=True)
+
+    # Agrupa por pixel (Lat/Lon)
+    df_pixel = df_bruto.groupby(['latitude', 'longitude']).sum().reset_index()
+
+    # Calcula Métricas
+    df_pixel['Frequencia'] = df_pixel[c_freq]
+    # Evita divisão por zero
+    df_pixel['Duracao'] = df_pixel[c_dias] / df_pixel[c_freq].replace(0, 1)
+    df_pixel['Magnitude'] = df_pixel[c_mag] / df_pixel[c_freq].replace(0, 1) # Magnitude média por evento
+
+    # Filtra onde não teve evento
+    df_final = df_pixel[df_pixel['Frequencia'] > 0].copy()
+
+    return df_final[['latitude', 'longitude', 'Frequencia', 'Duracao', 'Magnitude']]
+
+# ==============================================================================
+# 3. FUNÇÃO DE PLOTAGEM (AJUSTADA: Cores e Títulos)
+# ==============================================================================
+
+def plotar_mapa_bonito(
+        df,
+        coluna,
+        titulo_grafico,
+        label_legenda,
+        cmap,
+        arquivo_saida,
+        painel=None):
+
+    if df is None or df.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Limite superior para melhorar o contraste
+    vmax = df[coluna].quantile(0.98)
+
+    # Mapa
+    sc = ax.scatter(
+        df["longitude"],
+        df["latitude"],
+        c=df[coluna],
+        cmap=cmap,
+        s=1.5,
+        marker="s",
+        alpha=1.0,
+        vmin=0,
+        vmax=vmax
+    )
+
+    # Barra de cores
+    cbar = plt.colorbar(
+        sc,
+        ax=ax,
+        fraction=0.03,
+        pad=0.04
+    )
+
+    cbar.set_label(
+        label_legenda,
+        fontsize=12,
+        fontweight="bold"
+    )
+
+    cbar.ax.tick_params(labelsize=11)
+
+    # Painel (a), (b), (c)
+    if painel is not None:
+
+        ax.text(
+            0.02,
+            0.98,
+            painel,
+            transform=ax.transAxes,
+            fontsize=20,
+            fontweight="bold",
+            ha="left",
+            va="top"
+        )
+
+    # Título (opcional)
+    if titulo_grafico != "":
+        ax.set_title(
+            titulo_grafico,
+            fontsize=16,
+            fontweight="bold",
+            pad=15
+        )
+
+    # Eixos
+    ax.set_xlabel(
+        "Longitude (°)",
+        fontsize=12
+    )
+
+    ax.set_ylabel(
+        "Latitude (°)",
+        fontsize=12
+    )
+
+    ax.set_aspect("equal")
+
+    sns.despine()
+
+    plt.savefig(
+        OUT_MAPAS_IMG / arquivo_saida,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    print(f"   Mapa salvo: {arquivo_saida}")
+
+# ==============================================================================
+# 4. EXECUÇÃO - MAPAS DE FREQUÊNCIA DAS ONDAS DE CALOR
+# ==============================================================================
+
+# ==============================================================================
+# 4. EXECUÇÃO
+# ==============================================================================
+
+tarefas = [
+
+    (
+        DIR_LST,
+        "LST",
+        "Number of Events (LST)",
+        "(a)"
+    ),
+
+    (
+        DIR_TAR,
+        "ERA5",
+        "Number of Events (Air Temperature)",
+        "(b)"
+    ),
+
+    (
+        DIR_COMB,
+        "ACOPLADO",
+        "Number of Coupled Events",
+        "(c)"
+    )
+]
+
+for diretorio, nome_dado, legenda, painel in tarefas:
+
+    print(f"\n Processing {nome_dado}...")
+
+    df_geo = consolidar_dados_espaciais(
+        diretorio,
+        nome_dado
+    )
+
+    if df_geo is None or df_geo.empty:
+        print(f" No data found for {nome_dado}.")
+        continue
+
+    plotar_mapa_bonito(
+        df=df_geo,
+        coluna="Frequencia",
+        titulo_grafico="",
+        label_legenda=legenda,
+        cmap="Reds",
+        arquivo_saida=f"Figure_HeatWaveFrequency_{nome_dado}.png",
+        painel=painel
+    )
+
+    del df_geo
+    gc.collect()
+
+print("\n Heat wave frequency maps successfully generated!")
