@@ -1,0 +1,342 @@
+import pandas as pd
+import os
+import unicodedata
+from glob import glob
+
+print("=== 🕵️‍♂️ DETETIVE DE NOMES DE CIDADES ===")
+
+# --- 1. VERIFICAR INMET ---
+arquivo_inmet = os.path.join(OUT, "INMET.parquet")
+if os.path.exists(arquivo_inmet):
+    df_inmet = pd.read_parquet(arquivo_inmet)
+
+    # Pega cidades originais
+    cidades_inmet = sorted(df_inmet["municipio"].astype(str).unique())
+
+    print(f"\n📋 Cidades no arquivo INMET ({len(cidades_inmet)}):")
+    for c in cidades_inmet:
+        print(f"   -> '{c}'") # Aspas simples ajudam a ver espaços escondidos
+else:
+    print("❌ INMET.parquet não encontrado!")
+
+# --- 2. VERIFICAR ERA5 ---
+print(f"\n📋 Verificando arquivos ERA5...")
+arquivos_era5 = glob(os.path.join(OUT, "ERA5_*.parquet"))
+
+# Vamos pegar todas as cidades únicas de TODOS os arquivos ERA5
+cidades_era5_total = set()
+
+for f in arquivos_era5:
+    try:
+        df_temp = pd.read_parquet(f, columns=["municipio"])
+        uniqs = df_temp["municipio"].astype(str).unique()
+        cidades_era5_total.update(uniqs)
+    except:
+        pass
+
+cidades_era5_lista = sorted(list(cidades_era5_total))
+
+print(f"\n📦 Total de cidades únicas encontradas no ERA5: {len(cidades_era5_lista)}")
+print("Amostra das primeiras 20 cidades do ERA5:")
+for c in cidades_era5_lista[:20]:
+    print(f"   -> '{c}'")
+
+# --- 3. TENTATIVA DE CRUZAMENTO (SIMULAÇÃO) ---
+print("\n🔍 SIMULAÇÃO DE CRUZAMENTO:")
+
+def limpar(txt):
+    if pd.isna(txt): return ""
+    txt = str(txt).lower().strip()
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("utf-8")
+    return txt
+
+inmet_limpo = set([limpar(c) for c in cidades_inmet])
+era5_limpo = set([limpar(c) for c in cidades_era5_lista])
+
+comum = inmet_limpo.intersection(era5_limpo)
+
+print(f"Cidades INMET (limpas): {len(inmet_limpo)}")
+print(f"Cidades ERA5 (limpas):  {len(era5_limpo)}")
+print(f"✅ CIDADES EM COMUM: {len(comum)}")
+
+if len(comum) == 0:
+    print("\n❌ NENHUMA CIDADE BATEU! COMPARE AS LISTAS ACIMA.")
+    print("Olhe atentamente para os prints '->' e veja a diferença.")
+else:
+    print("\nCidades que bateram:")
+    print(comum)
+
+
+import pandas as pd
+import os
+from glob import glob
+
+print("=== INVESTIGAÇÃO DE DADOS ===")
+
+# 1. Olhar o que tem no INMET
+arq_inmet = os.path.join(OUT, "INMET.parquet")
+if os.path.exists(arq_inmet):
+    df_inmet = pd.read_parquet(arq_inmet)
+    print(f"\n📄 INMET ({len(df_inmet)} linhas)")
+    print("Colunas:", df_inmet.columns.tolist())
+
+    cidades_inmet = df_inmet["municipio"].unique()
+    print(f"Cidades encontradas ({len(cidades_inmet)}):")
+    print(cidades_inmet[:20]) # Mostra as 20 primeiras
+else:
+    print("❌ Arquivo INMET.parquet não encontrado!")
+
+# 2. Olhar o que tem no ERA5 (Pega o primeiro arquivo que achar)
+arqs_era5 = glob(os.path.join(OUT, "ERA5_*.parquet"))
+if arqs_era5:
+    arq_era5 = arqs_era5[0]
+    df_era5 = pd.read_parquet(arq_era5)
+    print(f"\n📄 ERA5 - Amostra: {os.path.basename(arq_era5)}")
+    print("Colunas:", df_era5.columns.tolist())
+
+    cidades_era5 = df_era5["municipio"].unique()
+    print(f"Cidades encontradas ({len(cidades_era5)}):")
+    print(cidades_era5[:20]) # Mostra as 20 primeiras
+else:
+    print("❌ Nenhum arquivo ERA5 encontrado!")
+
+# 3. Teste de Batimento
+if 'cidades_inmet' in locals() and 'cidades_era5' in locals():
+    # Converte para conjuntos para ver a interseção
+    set_inmet = set(cidades_inmet)
+    set_era5 = set(cidades_era5)
+
+    comum = set_inmet.intersection(set_era5)
+    print(f"\n🔍 Diagnóstico Final:")
+    print(f"Cidades no INMET: {len(set_inmet)}")
+    print(f"Cidades no ERA5 (amostra): {len(set_era5)}")
+    print(f"Cidades em COMUM: {len(comum)}")
+
+    if len(comum) == 0:
+        print("\n⚠ PROBLEMA IDENTIFICADO: Os nomes não batem!")
+        print(f"Exemplo INMET: '{str(cidades_inmet[0])}'")
+        print(f"Exemplo ERA5:  '{str(cidades_era5[0])}'")
+        print("Dica: Verifique se um tem acento e o outro não.")
+
+
+import pandas as pd
+import numpy as np
+import os
+import unicodedata
+from glob import glob
+
+# ==============================================================================
+# 0. FUNÇÃO DE PADRONIZAÇÃO (A "CHAVE UNIVERSAL")
+# ==============================================================================
+def criar_chave(texto):
+    """
+    Transforma 'São Paulo ' -> 'sao paulo'
+    Transforma 'Vitória da Conquista' -> 'vitoria da conquista'
+    """
+    if pd.isna(texto): return ""
+    # Converte para string, minúsculo e remove espaços nas pontas
+    txt = str(texto).lower().strip()
+    # Remove acentos (Normalização Unicode)
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("utf-8")
+    return txt
+
+# ==============================================================================
+# 1. LER INMET E OBTER MUNICÍPIOS VÁLIDOS
+# ==============================================================================
+print("=== PASSO 1: LENDO INMET ===")
+
+arquivo_inmet = os.path.join(OUT, "INMET.parquet")
+
+if not os.path.exists(arquivo_inmet):
+    raise FileNotFoundError("ERRO: O arquivo INMET.parquet não existe na pasta OUT.")
+
+# Lê o arquivo
+df_inmet = pd.read_parquet(arquivo_inmet)
+
+# Cria a chave de ligação
+df_inmet["chave_municipio"] = df_inmet["municipio"].apply(criar_chave)
+
+# Pega a lista de cidades únicas do INMET
+municipios_validos = set(df_inmet["chave_municipio"].unique())
+
+# Remove chave vazia se houver
+if "" in municipios_validos:
+    municipios_validos.remove("")
+
+print(f"✔ Arquivo INMET lido com sucesso.")
+print(f"✔ Total de Municípios no INMET: {len(municipios_validos)}")
+print("Exemplos de chaves válidas:", list(municipios_validos)[:5])
+
+# ==============================================================================
+# 2. LER ERA5 E FILTRAR PELO INMET
+# ==============================================================================
+print("\n=== PASSO 2: LENDO ERA5 E FILTRANDO ===")
+
+arquivos_era5 = glob(os.path.join(OUT, "ERA5_*.parquet"))
+dfs_era5_filtrados = []
+
+cont_arquivos_com_match = 0
+total_linhas_era5 = 0
+
+for f in arquivos_era5:
+    try:
+        # Carrega apenas colunas necessárias para o teste
+        df = pd.read_parquet(f, columns=["municipio", "data", "tmax", "tmin"])
+
+        # Cria a MESMA chave de padronização
+        df["chave_municipio"] = df["municipio"].apply(criar_chave)
+
+        # FILTRO: Mantém apenas linhas onde a chave existe na lista do INMET
+        df_match = df[df["chave_municipio"].isin(municipios_validos)].copy()
+
+        # Se sobrou alguma coisa, guarda
+        if not df_match.empty:
+            dfs_era5_filtrados.append(df_match)
+            cont_arquivos_com_match += 1
+            print(f"  ✔ {os.path.basename(f)}: Encontradas {len(df_match)} linhas compatíveis.")
+        else:
+            # Descomente a linha abaixo se quiser ver quais arquivos foram ignorados
+            # print(f"  ⚠ {os.path.basename(f)}: Nenhuma cidade coincidiu.")
+            pass
+
+    except Exception as e:
+        print(f"❌ Erro ao ler {os.path.basename(f)}: {e}")
+
+# ==============================================================================
+# 3. CONSOLIDAÇÃO FINAL
+# ==============================================================================
+print("\n=== RESULTADO FINAL ===")
+
+if not dfs_era5_filtrados:
+    print("❌ ERRO CRÍTICO: Nenhum dado do ERA5 coincidiu com o INMET.")
+    print("Possíveis causas:")
+    print("1. Os nomes das cidades estão escritos de forma muito diferente.")
+    print("2. Os arquivos ERA5 não cobrem a mesma região geográfica do INMET.")
+else:
+    df_era5_final = pd.concat(dfs_era5_filtrados, ignore_index=True)
+
+    qtd_cidades_era5 = df_era5_final["chave_municipio"].nunique()
+
+    print(f"✔ Sucesso! Dados ERA5 filtrados e consolidados.")
+    print(f"✔ Total de Linhas ERA5 Filtradas: {len(df_era5_final)}")
+    print(f"✔ Total de Municípios Únicos no ERA5: {qtd_cidades_era5}")
+    print(f"  (Esperado: próximo de {len(municipios_validos)})")
+
+    # Validação rápida de perda
+    perdidos = len(municipios_validos) - qtd_cidades_era5
+    if perdidos > 0:
+        print(f"⚠ Atenção: {perdidos} municípios do INMET não foram encontrados no ERA5.")
+    else:
+        print("✅ Perfeito: Todos os municípios do INMET foram encontrados no ERA5.")
+
+    # Guardamos na memória para o próximo passo
+    df_era5 = df_era5_final
+
+
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+import numpy as np
+
+print("=== INICIANDO VALIDAÇÃO ESTATÍSTICA ===")
+
+# ==============================================================================
+# 1. CRUZAMENTO (MERGE)
+# ==============================================================================
+# Garantia extra de tipo de data antes de cruzar
+df_era5['data'] = pd.to_datetime(df_era5['data'])
+df_inmet['data'] = pd.to_datetime(df_inmet['data'])
+
+print("🔄 Cruzando tabelas (Isso pode levar alguns segundos)...")
+
+# Inner join: Só mantém dias que existem NOS DOIS (par a par)
+df_final = pd.merge(
+    df_era5,
+    df_inmet[['chave_municipio', 'data', 'tmax', 'tmin']], # Pega só o necessário do INMET
+    on=['chave_municipio', 'data'],
+    suffixes=('_era5', '_inmet'),
+    how='inner'
+)
+
+# Remove linhas onde qualquer temperatura seja NaN (vazia)
+cols_validacao = ['tmax_era5', 'tmax_inmet', 'tmin_era5', 'tmin_inmet']
+df_final = df_final.dropna(subset=cols_validacao)
+
+print(f"✅ DADOS PAREADOS: {len(df_final)} dias prontos para análise.")
+
+if len(df_final) == 0:
+    raise ValueError("O cruzamento gerou 0 linhas. Verifique se as DATAS coincidem.")
+
+# ==============================================================================
+# 2. SALVAR DADOS
+# ==============================================================================
+pasta_validacao = os.path.join(OUT, "VALIDACAO_ERA5_INMET")
+os.makedirs(pasta_validacao, exist_ok=True)
+
+csv_pareado = os.path.join(pasta_validacao, "dados_pareados_completo.csv")
+df_final.to_csv(csv_pareado, index=False)
+print(f"💾 Tabela pareada salva em: {csv_pareado}")
+
+# ==============================================================================
+# 3. FUNÇÃO DE PLOTAGEM (HEXBIN + ESTATÍSTICAS)
+# ==============================================================================
+def plotar_validacao_final(df, col_modelo, col_obs, nome_arquivo):
+    plt.close('all') # Limpa memória
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    # --- A. Estatísticas ---
+    # Correlação de Pearson (r)
+    r, _ = pearsonr(df[col_modelo], df[col_obs])
+    # RMSE
+    rmse = np.sqrt(((df[col_modelo] - df[col_obs]) ** 2).mean())
+    # Bias (Viés)
+    bias = (df[col_modelo] - df[col_obs]).mean()
+
+    # --- B. Gráfico de Densidade (Hexbin) ---
+    # Usamos hexbin pq com muitos pontos o scatter fica uma mancha azul ilegível
+    hb = ax.hexbin(df[col_modelo], df[col_obs], gridsize=50, cmap='Blues', mincnt=1)
+    cb = plt.colorbar(hb, ax=ax)
+    cb.set_label('Number of days')
+
+    # --- C. Linha de Referência 1:1 ---
+    # Pega limites globais para traçar a linha diagonal perfeita
+    vmin = min(df[col_modelo].min(), df[col_obs].min())
+    vmax = max(df[col_modelo].max(), df[col_obs].max())
+    ax.plot([vmin, vmax], [vmin, vmax], 'r--', lw=2, label='Ideal (1:1)')
+
+    # --- D. Textos e Legendas ---
+    # Título da Variável (TMAX ou TMIN)
+    var_nome = col_modelo.split('_')[0].upper()
+
+    # ax.set_title(f"Validação: {var_nome} (ERA5 vs INMET)")
+    ax.set_xlabel(f"ERA5 {var_nome} (°C)")
+    ax.set_ylabel(f"INMET {var_nome} (°C)")
+    ax.legend(loc='lower right')
+
+    # Caixa de texto com as estatísticas
+    texto_stats = f"r = {r:.2f}\nRMSE = {rmse:.2f}\nBias = {bias:.2f}"
+
+    # Posição do texto (canto superior esquerdo)
+    ax.text(0.05, 0.95, texto_stats, transform=ax.transAxes,
+            verticalalignment='top', fontsize=12,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+
+    # --- E. Salvar ---
+    caminho_fig = os.path.join(pasta_validacao, nome_arquivo)
+    plt.savefig(caminho_fig, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"🖼 Gráfico gerado: {nome_arquivo}")
+    print(f"   -> {texto_stats.replace(chr(10), ' | ')}") # Imprime stats no console tb
+
+# ==============================================================================
+# 4. EXECUTAR
+# ==============================================================================
+print("\n📊 Gerando Gráficos...")
+
+# Validação TMAX
+plotar_validacao_final(df_final, "tmax_era5", "tmax_inmet", "validacao_tmax.png")
+
+# Validação TMIN
+plotar_validacao_final(df_final, "tmin_era5", "tmin_inmet", "validacao_tmin.png")
+
+print("\n✨ FIM! Verifique os resultados acima.")
+
