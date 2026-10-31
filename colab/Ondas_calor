@@ -1,0 +1,996 @@
+import pandas as pd
+import numpy as np
+import os
+from pathlib import Path
+import gc
+
+# ==============================================================================
+# CONFIGURAÇÕES
+# ==============================================================================
+OUT_FINAL = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+
+# Pastas de Saída (Cria as duas)
+OUT_DIARIO = OUT_FINAL / "DIARIO_CLASSIFICADO" # O "Pesado" (para EVI)
+OUT_MAPA = OUT_FINAL / "MAPAS_RESUMO"          # O "Leve" (para Mapas/Discussão)
+
+OUT_DIARIO.mkdir(exist_ok=True)
+OUT_MAPA.mkdir(exist_ok=True)
+
+# Definição da Onda (CTX90pct)
+PERCENTIL = 0.90
+DIAS_MINIMOS = 3
+
+print(f"🚀 Iniciando Processamento Híbrido (Diário + Mapa)...")
+
+# ==============================================================================
+# FUNÇÃO MASTER
+# ==============================================================================
+def processar_hibrido(arquivo_parquet, pasta_diario, pasta_mapa):
+    # --- 1. CARREGAR E PREPARAR ---
+    df = pd.read_parquet(arquivo_parquet)
+    df["data"] = pd.to_datetime(df["data"]) # Garante que é data
+    df = df.sort_values(["latitude", "longitude", "data"])
+
+    # Extrai Mês e Ano para poder agrupar depois
+    df["ano"] = df["data"].dt.year
+    df["mes"] = df["data"].dt.month
+
+    # Colunas essenciais para o mapa (Metadados estáticos)
+    cols_meta = ["latitude", "longitude", "municipio", "microrregiao", ".geo"]
+    cols_meta = [c for c in cols_meta if c in df.columns]
+
+    # --- 2. DETECÇÃO (DIÁRIA) ---
+    # Calcula limiar histórico por pixel
+    df["limiar_pixel"] = df.groupby(["latitude", "longitude"])["lst_interp"].transform(
+        lambda x: x.quantile(PERCENTIL)
+    )
+
+    df["acima_limiar"] = df["lst_interp"] > df["limiar_pixel"]
+
+    # Identifica sequências
+    df["grupo_temp"] = (df["acima_limiar"] != df.groupby(["latitude", "longitude"])["acima_limiar"].shift()).cumsum()
+
+    # Duração
+    df["duracao_grupo"] = df.groupby(["latitude", "longitude", "grupo_temp"])["acima_limiar"].transform("sum")
+
+    # Filtro de Onda
+    condicao_onda = (df["acima_limiar"]) & (df["duracao_grupo"] >= DIAS_MINIMOS)
+
+    # Flags Finais
+    df["flag_onda"] = np.where(condicao_onda, 1, 0).astype("int8")
+
+    # Intensidade
+    df["intensidade"] = np.where(df["flag_onda"] == 1,
+                                 df["lst_interp"] - df["limiar_pixel"],
+                                 0.0)
+
+    df["evento_id"] = np.where(df["flag_onda"] == 1, df["grupo_temp"], np.nan)
+
+    # --- 3. SALVAR PRODUTO 1: DIÁRIO ---
+    # No diário mantemos tudo (inclusive data, ano e mês)
+    df_save = df.drop(columns=["acima_limiar", "grupo_temp", "duracao_grupo"])
+
+    nome_diario = arquivo_parquet.name.replace("part_", "daily_hw_")
+    df_save.to_parquet(pasta_diario / nome_diario, index=False)
+
+    # --- 4. GERAR PRODUTO 2: RESUMO ESPACIAL + TEMPORAL (Para o Mapa) ---
+
+    # 🚨 AQUI ESTÁ A MUDANÇA: Agrupamos por Pixel E por Tempo (Ano/Mês)
+    # Isso permite que no QGIS você filtre "Ano = 2015" e "Mês = 1"
+
+    cols_agrupamento = cols_meta + ["ano", "mes"]
+
+    resumo = df.groupby(cols_agrupamento).agg(
+        total_dias_onda=("flag_onda", "sum"),
+        num_eventos=("evento_id", "nunique"),
+        intensidade_max=("intensidade", "max"),
+        intensidade_media=("intensidade", lambda x: x[x>0].mean() if x.max() > 0 else 0),
+        intensidade_acumulada=("intensidade", "sum"),
+        lst_medio_mensal=("lst_interp", "mean"), # Média do mês naquele pixel
+        limiar_usado=("limiar_pixel", "first")
+    ).reset_index()
+
+    # Filtro opcional: Se quiser salvar APENAS linhas que tiveram onda no mapa para economizar espaço:
+    # resumo = resumo[resumo["total_dias_onda"] > 0]
+    # (Eu recomendo NÃO filtrar se quiser pintar o mapa todo, inclusive onde foi zero)
+
+    # Salva resumo
+    nome_mapa = arquivo_parquet.name.replace("part_", "map_hw_mensal_")
+    resumo.to_parquet(pasta_mapa / nome_mapa, index=False)
+
+    return len(df_save), len(resumo)
+
+# ==============================================================================
+# LOOP PRINCIPAL
+# ==============================================================================
+pastas_micro = [p for p in OUT_FINAL.iterdir() if p.is_dir() and "RESULTADOS" not in p.name and "DIARIO" not in p.name and "MAPAS" not in p.name]
+
+for pasta in pastas_micro:
+    print(f"\n📍 Micro: {pasta.name}")
+
+    # Cria subpastas específicas
+    p_diario = OUT_DIARIO / pasta.name
+    p_mapa = OUT_MAPA / pasta.name
+    p_diario.mkdir(exist_ok=True, parents=True)
+    p_mapa.mkdir(exist_ok=True, parents=True)
+
+    arquivos = list(pasta.glob("part_*.parquet"))
+
+    count_linhas = 0
+
+    for i, arq in enumerate(arquivos):
+        try:
+            # Verifica se já existe
+            nome_final = arq.name.replace("part_", "daily_hw_")
+            if (p_diario / nome_final).exists():
+                print(f"   ⏭ {i+1}/{len(arquivos)} já processado.", end="\r")
+                continue
+
+            n_diario, n_mapa = processar_hibrido(arq, p_diario, p_mapa)
+            count_linhas += n_diario
+            print(f"   ✔ {i+1}/{len(arquivos)}: {n_mapa} pixels processados", end="\r")
+
+        except Exception as e:
+            print(f"   ❌ Erro em {arq.name}: {e}")
+
+    print(f"\n   ✅ Concluído.")
+    gc.collect()
+
+print("\n🏁 FIM! Verifique as pastas DIARIO_CLASSIFICADO e MAPAS_RESUMO.")
+
+import pandas as pd
+import os
+from pathlib import Path
+import gc
+
+# ==============================================================================
+# CONFIGURAÇÕES
+# ==============================================================================
+OUT_FINAL = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+
+SRC_LST = OUT_FINAL / "MAPAS_RESUMO"
+SRC_ERA = OUT_FINAL / "MAPAS_RESUMO_ERA5"
+OUT_GEE = OUT_FINAL / "GEE_UPLOAD"
+OUT_GEE.mkdir(exist_ok=True)
+
+print(f"📂 Preparando arquivos para o Google Earth Engine em: {OUT_GEE}")
+
+# ==============================================================================
+# FUNÇÃO CONVERSORA (CORRIGIDA - Tradução ano/mes -> year/month)
+# ==============================================================================
+def converter_para_csv_gee(pasta_origem, prefixo_arquivo):
+    if not pasta_origem.exists():
+        print(f"⚠ Pasta não encontrada: {pasta_origem}")
+        return
+
+    microrregioes = [p for p in pasta_origem.iterdir() if p.is_dir()]
+
+    print(f"\n🔄 Processando {len(microrregioes)} microrregiões de {prefixo_arquivo}...")
+
+    for micro in sorted(microrregioes):
+        nome_micro = micro.name
+        print(f"   ➡ {nome_micro}...", end=" ")
+
+        try:
+            arquivos = list(micro.glob("*.parquet"))
+            if not arquivos:
+                print("Ignorado (vazio).")
+                continue
+
+            # Consolida
+            dfs = [pd.read_parquet(f) for f in arquivos]
+            df_consolidado = pd.concat(dfs, ignore_index=True)
+
+            # --- CORREÇÃO DO ERRO ---
+            # O Pandas exige nomes em inglês para criar data automaticamente
+            if "ano" in df_consolidado.columns and "mes" in df_consolidado.columns:
+                # Criamos um dataframe temporário com os nomes certos só para o cálculo
+                temp_dates = df_consolidado[["ano", "mes"]].rename(columns={"ano": "year", "mes": "month"})
+                temp_dates["day"] = 1 # O GEE precisa de dia, fixamos dia 1
+
+                # Agora o pd.to_datetime vai entender
+                df_consolidado["date_str"] = pd.to_datetime(temp_dates).dt.strftime("%Y-%m-%d")
+
+            # Remove geometria se existir (GEE prefere lat/lon puros em CSV)
+            if ".geo" in df_consolidado.columns:
+                df_consolidado = df_consolidado.drop(columns=[".geo"])
+
+            # Salva CSV
+            nome_csv = f"{prefixo_arquivo}_{nome_micro}.csv"
+            caminho_csv = OUT_GEE / nome_csv
+            df_consolidado.to_csv(caminho_csv, index=False)
+
+            print(f"✅ Salvo ({len(df_consolidado)} linhas)")
+
+            del df_consolidado, dfs
+            gc.collect()
+
+        except Exception as e:
+            print(f"❌ Erro: {e}")
+
+# ==============================================================================
+# EXECUÇÃO
+# ==============================================================================
+
+# 1. Converter Mapas de LST
+converter_para_csv_gee(SRC_LST, "LST")
+
+# 2. Converter Mapas de ERA5
+converter_para_csv_gee(SRC_ERA, "ERA5")
+
+print("\n🏁 FIM! Baixe os arquivos da pasta 'GEE_UPLOAD' e suba no Earth Engine.")
+
+
+import pandas as pd
+import numpy as np
+import os
+from pathlib import Path
+import gc
+
+# ==============================================================================
+# CONFIGURAÇÕES
+# ==============================================================================
+BASE_DIR = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+
+# Entradas (Resultados dos scripts anteriores)
+DIR_LST_DIARIO = BASE_DIR / "DIARIO_CLASSIFICADO"
+DIR_ERA_DIARIO = BASE_DIR / "DIARIO_CLASSIFICADO_ERA5"
+
+# Saída (Novos arquivos com as métricas combinadas)
+OUT_COMBINADO = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+OUT_COMBINADO.mkdir(parents=True, exist_ok=True)
+
+print(f"🔗 Iniciando Cálculo de Métricas de Eventos Acoplados (LST + ERA5)...")
+
+# ==============================================================================
+# FUNÇÃO DE CÁLCULO DE MÉTRICAS
+# ==============================================================================
+def processar_acoplamento_metricas(arquivo_lst, arquivo_era, pasta_saida):
+
+    # --- 1. CARREGAR DADOS ---
+    # Lê LST (apenas colunas necessárias para economizar memória)
+    cols_lst = ['latitude', 'longitude', 'data', 'ano', 'mes', 'flag_onda', 'intensidade', 'municipio', 'microrregiao']
+    df_lst = pd.read_parquet(arquivo_lst, columns=[c for c in cols_lst])
+
+    # Lê ERA5
+    cols_era = ['latitude', 'longitude', 'data', 'flag_onda_era5', 'intensidade_era5']
+    df_era = pd.read_parquet(arquivo_era, columns=[c for c in cols_era])
+
+    # Garante datetime
+    df_lst['data'] = pd.to_datetime(df_lst['data'])
+    df_era['data'] = pd.to_datetime(df_era['data'])
+
+    # --- 2. CRUZAMENTO (MERGE) ---
+    # Une as tabelas onde Local e Data são iguais
+    df_full = pd.merge(df_lst, df_era, on=['latitude', 'longitude', 'data'], how='inner')
+
+    # Libera memória das partes individuais
+    del df_lst, df_era
+    gc.collect()
+
+    if df_full.empty:
+        return 0
+
+    # --- 3. IDENTIFICAR ONDAS ACOPLADAS ---
+    # Ocorre apenas se AMBOS estiverem ativos
+    df_full['flag_combinado'] = np.where(
+        (df_full['flag_onda'] == 1) & (df_full['flag_onda_era5'] == 1),
+        1, 0
+    ).astype('int8')
+
+    # Se não houver nenhum acoplamento no arquivo, retorna (salva vazio ou pula)
+    if df_full['flag_combinado'].sum() == 0:
+        return 0
+
+    # --- 4. IDENTIFICAR EVENTOS ÚNICOS (Recalcular Grupos) ---
+    # Como a intersecção pode fragmentar ondas maiores, precisamos re-identificar os grupos
+    df_full = df_full.sort_values(['latitude', 'longitude', 'data'])
+
+    # Lógica de agrupamento: muda o ID do grupo sempre que o flag muda ou muda o pixel
+    df_full['mudanca'] = (df_full['flag_combinado'] != df_full.groupby(['latitude', 'longitude'])['flag_combinado'].shift())
+    df_full['evento_id_comb'] = df_full.groupby(['latitude', 'longitude'])['mudanca'].cumsum()
+
+    # Filtra apenas o que é evento (flag = 1)
+    df_eventos = df_full[df_full['flag_combinado'] == 1].copy()
+
+    # --- 5. CALCULAR MÉTRICAS DO ACOPLAMENTO ---
+    # Aqui calculamos a duração real da sobreposição
+
+    # Agrupamento por Evento Único para pegar Duração e Magnitude do evento
+    stats_eventos = df_eventos.groupby(['latitude', 'longitude', 'evento_id_comb', 'ano', 'mes']).agg(
+        duracao_dias=('data', 'count'),
+
+        # Intensidades médias durante o acoplamento
+        int_media_lst=('intensidade', 'mean'),
+        int_media_ar=('intensidade_era5', 'mean'),
+
+        # Magnitudes (Soma das intensidades durante os dias acoplados)
+        mag_lst=('intensidade', 'sum'),
+        mag_ar=('intensidade_era5', 'sum')
+    ).reset_index()
+
+    # --- 6. RESUMO MENSAL (Para Tabelas e Mapas) ---
+    # Agora agrupamos os eventos por mês para gerar o arquivo final similar aos anteriores
+
+    resumo_mensal = stats_eventos.groupby(['latitude', 'longitude', 'ano', 'mes']).agg(
+        freq_eventos=('duracao_dias', 'count'),      # Quantos eventos acoplados houve no mês
+        dias_sob_onda=('duracao_dias', 'sum'),       # Total de dias no mês
+
+        duracao_media=('duracao_dias', 'mean'),      # Duração média dos eventos
+
+        # Médias das Intensidades
+        intensidade_lst_media=('int_media_lst', 'mean'),
+        intensidade_ar_media=('int_media_ar', 'mean'),
+
+        # Magnitudes Acumuladas
+        magnitude_lst_total=('mag_lst', 'sum'),
+        magnitude_ar_total=('mag_ar', 'sum')
+    ).reset_index()
+
+    # Adiciona metadados de volta (Município/Micro) pegando do df original
+    # (Pega o primeiro valor encontrado para aquele pixel)
+    meta = df_full[['latitude', 'longitude', 'municipio', 'microrregiao']].drop_duplicates(['latitude', 'longitude'])
+    resumo_mensal = pd.merge(resumo_mensal, meta, on=['latitude', 'longitude'], how='left')
+
+    # --- 7. SALVAR ---
+    nome_saida = arquivo_lst.name.replace("daily_hw_", "metrics_coupled_")
+    resumo_mensal.to_parquet(pasta_saida / nome_saida, index=False)
+
+    return len(resumo_mensal)
+
+# ==============================================================================
+# LOOP PRINCIPAL
+# ==============================================================================
+pastas_lst = sorted([p for p in DIR_LST_DIARIO.iterdir() if p.is_dir()])
+
+for pasta_lst in pastas_lst:
+    nome_micro = pasta_lst.name
+    pasta_era = DIR_ERA_DIARIO / nome_micro
+
+    # Verifica se existe correspondente
+    if not pasta_era.exists():
+        print(f"⚠ Pulei {nome_micro} (sem pasta correspondente no ERA5)")
+        continue
+
+    print(f"\n📍 Processando Acoplamento: {nome_micro}")
+
+    # Cria pasta de saída
+    p_saida = OUT_COMBINADO / nome_micro
+    p_saida.mkdir(parents=True, exist_ok=True)
+
+    arquivos_lst = list(pasta_lst.glob("daily_hw_*.parquet"))
+
+    count_proc = 0
+    for arq_lst in arquivos_lst:
+        try:
+            # Tenta achar o arquivo correspondente no ERA5
+            # Assumindo que a estrutura de nomes "part_X" ou similar se manteve
+            nome_arq_era = arq_lst.name.replace("daily_hw_", "daily_hw_era5_")
+            arq_era = pasta_era / nome_arq_era
+
+            if not arq_era.exists():
+                # Tenta fallback se os nomes mudaram de part_X
+                # (Estratégia: lista arquivos ERA e pega pelo índice se forem ordenados igual)
+                continue
+
+            nome_final = arq_lst.name.replace("daily_hw_", "metrics_coupled_")
+            if (p_saida / nome_final).exists():
+                print(f"   ⏭ Arquivo já existe, pulando.", end="\r")
+                continue
+
+            n_linhas = processar_acoplamento_metricas(arq_lst, arq_era, p_saida)
+            count_proc += 1
+            print(f"   ✔ Arquivo processado ({n_linhas} linhas de resumo)", end="\r")
+
+        except Exception as e:
+            print(f"   ❌ Erro: {e}")
+
+    print(f"\n   ✅ {count_proc} arquivos processados em {nome_micro}.")
+    gc.collect()
+
+print("\n🏁 FIM! Os arquivos em 'METRICAS_ACOPLAMENTO_FINAL' contém Frequência, Duração, Intensidade e Magnitude dos eventos combinados.")
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+# ==============================================================================
+# 1. CONFIGURAÇÕES
+# ==============================================================================
+BASE_DIR = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+
+# Diretórios dos dados
+DIR_LST = BASE_DIR / "MAPAS_RESUMO"
+DIR_TAR = BASE_DIR / "MAPAS_RESUMO_ERA5"
+DIR_COMB = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+
+# Onde salvar o gráfico
+ARQUIVO_GRAFICO = BASE_DIR / "Grafico_Frequencia_Anual_Comparativo.png"
+
+# Cores das linhas
+CORES = {
+    "LST (Soil)": "#ff7f0e",       # Laranja
+    "Tar (Air)": "#1f77b4",         # Azul
+    "Coupled (LST+Tar)": "#d62728" # Vermelho
+}
+
+print("📊 Lendo dados e consolidando frequências anuais...")
+
+# ==============================================================================
+# 2. FUNÇÃO PARA LER E AGRUPAR POR ANO
+# ==============================================================================
+def obter_frequencia_anual(diretorio, nome_coluna_freq, rotulo_legenda):
+    if not diretorio.exists():
+        print(f"⚠ Pasta não encontrada: {diretorio}")
+        return pd.DataFrame()
+
+    # --- CORREÇÃO 1: USAR rglob PARA BUSCAR EM SUBPASTAS ---
+    # Seus arquivos estão dentro de pastas de microrregiões (ex: MAPAS_RESUMO/Micro_X/arquivo.parquet)
+    arquivos = list(diretorio.rglob("*.parquet"))
+
+    if not arquivos:
+        print(f"⚠ Nenhum arquivo encontrado em {diretorio.name} (Verifique se processou o passo anterior)")
+        return pd.DataFrame()
+
+    print(f"   📂 Processando {rotulo_legenda} ({len(arquivos)} arquivos encontrados)...")
+
+    # Lê apenas as colunas 'ano' e a de 'frequencia'
+    dfs = []
+    for f in arquivos:
+        try:
+            # Tenta ler colunas. Se falhar, pula.
+            df = pd.read_parquet(f, columns=["ano", nome_coluna_freq])
+            dfs.append(df)
+        except Exception:
+            continue
+
+    if not dfs:
+        return pd.DataFrame()
+
+    df_full = pd.concat(dfs, ignore_index=True)
+
+    # Agrupa por ano e soma a frequência
+    df_anual = df_full.groupby("ano")[nome_coluna_freq].sum().reset_index()
+
+    # Renomeia para padronizar (Tudo com Maiúscula para evitar erro depois)
+    df_anual.columns = ["Ano", "Frequencia"]
+    df_anual["Tipo"] = rotulo_legenda
+
+    return df_anual
+
+# ==============================================================================
+# 3. CARREGAR OS DADOS
+# ==============================================================================
+
+# LST (Usa a coluna 'num_eventos')
+df_lst = obter_frequencia_anual(DIR_LST, "num_eventos", "LST (Soil)")
+
+# Tar - ERA5 (Usa a coluna 'num_eventos')
+df_tar = obter_frequencia_anual(DIR_TAR, "num_eventos", "Tar (Air)")
+
+# Acoplado (Usa a coluna 'freq_eventos')
+df_comb = obter_frequencia_anual(DIR_COMB, "freq_eventos", "Coupled (LST+Tar)")
+
+# Junta tudo num dataframe só para o Seaborn
+df_final = pd.concat([df_lst, df_tar, df_comb], ignore_index=True)
+
+# ==============================================================================
+# 4. PLOTAR O GRÁFICO
+# ==============================================================================
+if not df_final.empty:
+    # --- CORREÇÃO 2: GARANTIR NOME DA COLUNA ---
+    # Como renomeamos para "Ano" (Maiúsculo) na função, usamos "Ano" aqui
+    df_final["Ano"] = df_final["Ano"].astype(int)
+    df_final = df_final.sort_values("Ano")
+
+    plt.figure(figsize=(12, 6))
+    sns.set_style("whitegrid")
+
+    # Plota as linhas com marcadores
+    sns.lineplot(
+        data=df_final,
+        x="Ano",
+        y="Frequencia",
+        hue="Tipo",
+        palette=CORES,
+        style="Tipo",
+        markers=True,
+        dashes=False,
+        linewidth=2.5,
+        markersize=8
+    )
+
+    # Títulos e Eixos
+    # plt.title("Frequência Anual de Ondas de Calor: Solo vs Ar vs Acopladas", fontsize=16, fontweight='bold', pad=15)
+    plt.xlabel("Year", fontsize=12)
+    plt.ylabel("Total Number of Detected Events", fontsize=12)
+
+    # Ajuste do Eixo X para mostrar todos os anos inteiros
+    anos_unicos = df_final["Ano"].unique()
+    plt.xticks(anos_unicos, rotation=45)
+
+    # Legenda
+    plt.legend(title="Event Type", fontsize=11, title_fontsize=12)
+
+    plt.tight_layout()
+
+    # Salvar
+    plt.savefig(ARQUIVO_GRAFICO, dpi=300)
+    plt.show()
+
+    print(f"\n✅ Gráfico salvo com sucesso em:\n{ARQUIVO_GRAFICO}")
+
+    # Exibe tabela rápida no console
+    print("\n--- Resumo dos Dados Plotados ---")
+    pivoted = df_final.pivot(index="Ano", columns="Tipo", values="Frequencia").fillna(0)
+    print(pivoted)
+
+else:
+    print("❌ Erro: Dataframe vazio. Isso significa que o script não encontrou nenhum arquivo .parquet nas subpastas.")
+    print(f"   Verifique se a pasta {DIR_LST} realmente contém subpastas com arquivos.")
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+# ==============================================================================
+# 1. CONFIGURAÇÕES
+# ==============================================================================
+BASE_DIR = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+
+# Diretórios dos dados
+DIR_LST = BASE_DIR / "MAPAS_RESUMO"
+DIR_TAR = BASE_DIR / "MAPAS_RESUMO_ERA5"
+DIR_COMB = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+
+# Onde salvar o gráfico
+ARQUIVO_GRAFICO = BASE_DIR / "Grafico_Frequencia_Anual_Comparativo.png"
+
+# Cores das linhas
+CORES = {
+    "LST (Soil)": "#ff7f0e",       # Laranja
+    "Tar (Air)": "#1f77b4",         # Azul
+    "Coupled (LST+Tar)": "#d62728" # Vermelho
+}
+
+print("📊 Lendo dados e consolidando frequências anuais...")
+
+# ==============================================================================
+# 2. FUNÇÃO PARA LER E AGRUPAR POR ANO
+# ==============================================================================
+def obter_frequencia_anual(diretorio, nome_coluna_freq, rotulo_legenda):
+    if not diretorio.exists():
+        print(f"⚠ Pasta não encontrada: {diretorio}")
+        return pd.DataFrame()
+
+    # --- CORREÇÃO 1: USAR rglob PARA BUSCAR EM SUBPASTAS ---
+    # Seus arquivos estão dentro de pastas de microrregiões (ex: MAPAS_RESUMO/Micro_X/arquivo.parquet)
+    arquivos = list(diretorio.rglob("*.parquet"))
+
+    if not arquivos:
+        print(f"⚠ Nenhum arquivo encontrado em {diretorio.name} (Verifique se processou o passo anterior)")
+        return pd.DataFrame()
+
+    print(f"   📂 Processando {rotulo_legenda} ({len(arquivos)} arquivos encontrados)...")
+
+    # Lê apenas as colunas 'ano' e a de 'frequencia'
+    dfs = []
+    for f in arquivos:
+        try:
+            # Tenta ler colunas. Se falhar, pula.
+            df = pd.read_parquet(f, columns=["ano", nome_coluna_freq])
+            dfs.append(df)
+        except Exception:
+            continue
+
+    if not dfs:
+        return pd.DataFrame()
+
+    df_full = pd.concat(dfs, ignore_index=True)
+
+    # Agrupa por ano e soma a frequência
+    df_anual = df_full.groupby("ano")[nome_coluna_freq].sum().reset_index()
+
+    # Renomeia para padronizar (Tudo com Maiúscula para evitar erro depois)
+    df_anual.columns = ["Ano", "Frequencia"]
+    df_anual["Tipo"] = rotulo_legenda
+
+    return df_anual
+
+# ==============================================================================
+# 3. CARREGAR OS DADOS
+# ==============================================================================
+
+# LST (Usa a coluna 'num_eventos')
+df_lst = obter_frequencia_anual(DIR_LST, "num_eventos", "LST (Soil)")
+
+# Tar - ERA5 (Usa a coluna 'num_eventos')
+df_tar = obter_frequencia_anual(DIR_TAR, "num_eventos", "Tar (Air)")
+
+# Acoplado (Usa a coluna 'freq_eventos')
+df_comb = obter_frequencia_anual(DIR_COMB, "freq_eventos", "Coupled (LST+Tar)")
+
+# Junta tudo num dataframe só para o Seaborn
+df_final = pd.concat([df_lst, df_tar, df_comb], ignore_index=True)
+
+# ==============================================================================
+# 4. PLOTAR O GRÁFICO
+# ==============================================================================
+if not df_final.empty:
+
+    df_final["Ano"] = df_final["Ano"].astype(int)
+    df_final = df_final.sort_values("Ano")
+
+    plt.figure(figsize=(12, 6))
+    sns.set_style("whitegrid")
+
+    # Plota as linhas
+    sns.lineplot(
+        data=df_final,
+        x="Ano",
+        y="Frequencia",
+        hue="Tipo",
+        palette=CORES,
+        style="Tipo",
+        markers=True,
+        dashes=False,
+        linewidth=2.5,
+        markersize=8
+    )
+
+    # Painel (a)
+    plt.text(
+        0.02,
+        0.98,
+        "(a)",
+        transform=plt.gca().transAxes,
+        fontsize=18,
+        fontweight="bold",
+        ha="left",
+        va="top"
+    )
+
+    # Eixos
+    plt.xlabel("Year", fontsize=12)
+    plt.ylabel("Total Number of Detected Events", fontsize=12)
+
+    # Eixo X
+    anos_unicos = sorted(df_final["Ano"].unique())
+    plt.xticks(anos_unicos, rotation=45)
+
+    # Legenda
+    plt.legend(title="Event Type", fontsize=11, title_fontsize=12)
+
+    plt.tight_layout()
+
+    # Salvar
+    plt.savefig(ARQUIVO_GRAFICO, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    print(f"\n✅ Gráfico salvo com sucesso em:\n{ARQUIVO_GRAFICO}")
+
+    print("\n--- Resumo dos Dados Plotados ---")
+    pivoted = df_final.pivot(index="Ano", columns="Tipo", values="Frequencia").fillna(0)
+    print(pivoted)
+
+else:
+
+    print("❌ Erro: Dataframe vazio. Isso significa que o script não encontrou nenhum arquivo .parquet nas subpastas.")
+    print(f"   Verifique se a pasta {DIR_LST} realmente contém subpastas com arquivos.")
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.ndimage import label
+from pathlib import Path
+import os
+
+# ==============================================================================
+# 1. MONTAGEM DO DRIVE E CONFIGURAÇÕES INICIAIS
+# ==============================================================================
+from google.colab import drive
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
+
+# --- CONFIGURAÇÃO DE ÁREA MÍNIMA (O "FILTRO DE RÍGIDO") ---
+# 1 pixel Landsat = 30m x 30m = 900 m²
+# 11 pixels ≈ 1 hectare (10.000 m²)
+# Sugestão: Usar 10 para remover ruídos de telhados/pequenas clareiras
+MIN_PIXELS = 10
+
+# Caminhos das pastas
+BASE_DIR = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+DIR_LST = BASE_DIR / "MAPAS_RESUMO"
+DIR_TAR = BASE_DIR / "MAPAS_RESUMO_ERA5"
+DIR_COMB = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+
+# Saídas
+ARQUIVO_GRAFICO = BASE_DIR / "Grafico_Frequencia_Objetos_Conectados.png"
+ARQUIVO_TABELA = BASE_DIR / "Tabela_Frequencia_Eventos_Filtrados.csv"
+
+CORES = {"LST (Soil)": "#ff7f0e", "Tar (Air)": "#1f77b4", "Coupled (LST+Tar)": "#d62728"}
+
+# ==============================================================================
+# 2. FUNÇÃO DE DETECÇÃO DE MANCHAS (CLUSTERS) COM FILTRO DE ÁREA
+# ==============================================================================
+def contar_sistemas_termicos(df_mes, col_valor):
+    """
+    Identifica manchas conectadas e filtra por tamanho mínimo.
+    """
+    if df_mes.empty or df_mes[col_valor].sum() == 0:
+        return 0
+    try:
+        # Criar a grade espacial (Lat x Lon)
+        grid = df_mes.pivot_table(index='latitude', columns='longitude',
+                                  values=col_valor, aggfunc='max').fillna(0)
+
+        # Matriz binária (1 onde há onda de calor)
+        matriz_binaria = (grid.values > 0).astype(int)
+
+        # Algoritmo de Rotulagem (Conectividade 8 - inclui diagonais)
+        estrutura = np.ones((3, 3))
+        matriz_rotulada, _ = label(matriz_binaria, structure=estrutura)
+
+        # Contagem de pixels por cada mancha detectada
+        ids_manchas, contagem_pixels = np.unique(matriz_rotulada, return_counts=True)
+
+        # Filtro: Só conta manchas que não são o fundo (ID 0) e têm tamanho >= MIN_PIXELS
+        manchas_reais = [c for i, c in zip(ids_manchas, contagem_pixels) if i != 0 and c >= MIN_PIXELS]
+
+        return len(manchas_reais)
+    except Exception:
+        return 0
+
+# ==============================================================================
+# 3. MOTOR DE PROCESSAMENTO DE ARQUIVOS
+# ==============================================================================
+def processar_categoria(diretorio, nome_coluna, rotulo):
+    if not diretorio.exists():
+        print(f"⚠ Direitório não encontrado: {diretorio.name}")
+        return pd.DataFrame()
+
+    arquivos = list(diretorio.rglob("*.parquet"))
+    print(f"🚀 Analisando {rotulo} ({len(arquivos)} arquivos)...")
+
+    resultados_lista = []
+
+    for f in arquivos:
+        # Lemos apenas as colunas necessárias para performance
+        df = pd.read_parquet(f, columns=["ano", "mes", "latitude", "longitude", nome_coluna])
+
+        # Agrupamos por Ano e Mês para isolar os eventos no tempo
+        for (ano, mes), grupo_mes in df.groupby(["ano", "mes"]):
+            total_objetos = contar_sistemas_termicos(grupo_mes, nome_coluna)
+            if total_objetos > 0:
+                resultados_lista.append({"Ano": ano, "Event Type": rotulo, "Frequencia": total_objetos})
+
+    if not resultados_lista:
+        return pd.DataFrame()
+
+    df_parcial = pd.DataFrame(resultados_lista)
+    # Soma os eventos mensais para compor o total anual
+    return df_parcial.groupby(["Ano", "Event Type"])["Frequencia"].sum().reset_index()
+
+# ==============================================================================
+# 4. EXECUÇÃO, EXPORTAÇÃO E PLOTAGEM
+# ==============================================================================
+# Processar as 3 fontes de dados
+df_lst = processar_categoria(DIR_LST, "num_eventos", "LST (Soil)")
+df_tar = processar_categoria(DIR_TAR, "num_eventos", "Tar (Air)")
+df_comb = processar_categoria(DIR_COMB, "freq_eventos", "Coupled (LST+Tar)")
+
+# Unificar
+df_final = pd.concat([df_lst, df_tar, df_comb], ignore_index=True)
+
+if not df_final.empty:
+    # --- SALVAR TABELA CSV ---
+    tabela_pivot = df_final.pivot(index="Ano", columns="Event Type", values="Frequencia").fillna(0).astype(int)
+    tabela_pivot.to_csv(ARQUIVO_TABELA)
+    print(f"\n✅ Tabela salva em: {ARQUIVO_TABELA}")
+
+    # --- GERAR GRÁFICO ---
+    plt.figure(figsize=(14, 7))
+    sns.set_style("whitegrid")
+
+    sns.lineplot(data=df_final, x="Ano", y="Frequencia", hue="Event Type",
+                 palette=CORES, marker="o", linewidth=2.5, markersize=8)
+
+    # plt.title(f"Frequência de Ondas de Calor: Sistemas Regionais",
+    #         fontsize=15, fontweight='bold', pad=20)
+    plt.ylabel("Number of Events (Distinct Spots)", fontsize=12)
+    plt.xlabel("Year", fontsize=12)
+
+    anos_eixo = sorted(df_final["Ano"].unique())
+    plt.xticks(anos_eixo, rotation=45)
+
+    plt.tight_layout()
+    plt.savefig(ARQUIVO_GRAFICO, dpi=300)
+    plt.show()
+
+    print("\n--- RESUMO DOS EVENTOS POR ANO ---")
+    print(tabela_pivot)
+else:
+    print("❌ Falha crítica: Nenhum dado foi processado. Verifique as colunas e pastas.")
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.ndimage import label
+from pathlib import Path
+import os
+
+# ==============================================================================
+# 1. MONTAGEM DO DRIVE E CONFIGURAÇÕES INICIAIS
+# ==============================================================================
+from google.colab import drive
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
+
+# --- CONFIGURAÇÃO DE ÁREA MÍNIMA (O "FILTRO DE RÍGIDO") ---
+# 1 pixel Landsat = 30m x 30m = 900 m²
+# 11 pixels ≈ 1 hectare (10.000 m²)
+# Sugestão: Usar 10 para remover ruídos de telhados/pequenas clareiras
+MIN_PIXELS = 10
+
+# Caminhos das pastas
+BASE_DIR = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+DIR_LST = BASE_DIR / "MAPAS_RESUMO"
+DIR_TAR = BASE_DIR / "MAPAS_RESUMO_ERA5"
+DIR_COMB = BASE_DIR / "METRICAS_ACOPLAMENTO_FINAL"
+
+# Saídas
+ARQUIVO_GRAFICO = BASE_DIR / "Grafico_Frequencia_Objetos_Conectados.png"
+ARQUIVO_TABELA = BASE_DIR / "Tabela_Frequencia_Eventos_Filtrados.csv"
+
+CORES = {"LST (Soil)": "#ff7f0e", "Tar (Air)": "#1f77b4", "Coupled (LST+Tar)": "#d62728"}
+
+# ==============================================================================
+# 2. FUNÇÃO DE DETECÇÃO DE MANCHAS (CLUSTERS) COM FILTRO DE ÁREA
+# ==============================================================================
+def contar_sistemas_termicos(df_mes, col_valor):
+    """
+    Identifica manchas conectadas e filtra por tamanho mínimo.
+    """
+    if df_mes.empty or df_mes[col_valor].sum() == 0:
+        return 0
+    try:
+        # Criar a grade espacial (Lat x Lon)
+        grid = df_mes.pivot_table(index='latitude', columns='longitude',
+                                  values=col_valor, aggfunc='max').fillna(0)
+
+        # Matriz binária (1 onde há onda de calor)
+        matriz_binaria = (grid.values > 0).astype(int)
+
+        # Algoritmo de Rotulagem (Conectividade 8 - inclui diagonais)
+        estrutura = np.ones((3, 3))
+        matriz_rotulada, _ = label(matriz_binaria, structure=estrutura)
+
+        # Contagem de pixels por cada mancha detectada
+        ids_manchas, contagem_pixels = np.unique(matriz_rotulada, return_counts=True)
+
+        # Filtro: Só conta manchas que não são o fundo (ID 0) e têm tamanho >= MIN_PIXELS
+        manchas_reais = [c for i, c in zip(ids_manchas, contagem_pixels) if i != 0 and c >= MIN_PIXELS]
+
+        return len(manchas_reais)
+    except Exception:
+        return 0
+
+# ==============================================================================
+# 3. MOTOR DE PROCESSAMENTO DE ARQUIVOS
+# ==============================================================================
+def processar_categoria(diretorio, nome_coluna, rotulo):
+    if not diretorio.exists():
+        print(f"⚠ Direitório não encontrado: {diretorio.name}")
+        return pd.DataFrame()
+
+    arquivos = list(diretorio.rglob("*.parquet"))
+    print(f"🚀 Analisando {rotulo} ({len(arquivos)} arquivos)...")
+
+    resultados_lista = []
+
+    for f in arquivos:
+        # Lemos apenas as colunas necessárias para performance
+        df = pd.read_parquet(f, columns=["ano", "mes", "latitude", "longitude", nome_coluna])
+
+        # Agrupamos por Ano e Mês para isolar os eventos no tempo
+        for (ano, mes), grupo_mes in df.groupby(["ano", "mes"]):
+            total_objetos = contar_sistemas_termicos(grupo_mes, nome_coluna)
+            if total_objetos > 0:
+                resultados_lista.append({"Ano": ano, "Event Type": rotulo, "Frequencia": total_objetos})
+
+    if not resultados_lista:
+        return pd.DataFrame()
+
+    df_parcial = pd.DataFrame(resultados_lista)
+    # Soma os eventos mensais para compor o total anual
+    return df_parcial.groupby(["Ano", "Event Type"])["Frequencia"].sum().reset_index()
+
+# ==============================================================================
+# 4. EXECUÇÃO, EXPORTAÇÃO E PLOTAGEM
+# ==============================================================================
+# ==============================================================================
+# 4. EXECUÇÃO, EXPORTAÇÃO E PLOTAGEM
+# ==============================================================================
+
+# Processar as 3 fontes de dados
+df_lst = processar_categoria(DIR_LST, "num_eventos", "LST (Soil)")
+df_tar = processar_categoria(DIR_TAR, "num_eventos", "Tar (Air)")
+df_comb = processar_categoria(DIR_COMB, "freq_eventos", "Coupled (LST+Tar)")
+
+# Unificar
+df_final = pd.concat([df_lst, df_tar, df_comb], ignore_index=True)
+
+if not df_final.empty:
+
+    # --- SALVAR TABELA CSV ---
+    tabela_pivot = (
+        df_final
+        .pivot(index="Ano", columns="Event Type", values="Frequencia")
+        .fillna(0)
+        .astype(int)
+    )
+
+    tabela_pivot.to_csv(ARQUIVO_TABELA)
+
+    print(f"\n✅ Tabela salva em: {ARQUIVO_TABELA}")
+
+    # --- GERAR GRÁFICO ---
+    plt.figure(figsize=(14, 7))
+    sns.set_style("whitegrid")
+
+    sns.lineplot(
+        data=df_final,
+        x="Ano",
+        y="Frequencia",
+        hue="Event Type",
+        palette=CORES,
+        marker="o",
+        linewidth=2.5,
+        markersize=8
+    )
+
+    # Painel (b)
+    plt.text(
+        0.015,
+        0.985,
+        "(b)",
+        transform=plt.gca().transAxes,
+        fontsize=20,
+        fontweight="bold",
+        ha="left",
+        va="top"
+    )
+
+    plt.ylabel("Number of Events (Distinct Spots)", fontsize=12)
+    plt.xlabel("Year", fontsize=12)
+
+    anos_eixo = sorted(df_final["Ano"].unique())
+    plt.xticks(anos_eixo, rotation=45)
+
+    plt.legend(
+        title="Event Type",
+        fontsize=11,
+        title_fontsize=12,
+        loc="best"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        ARQUIVO_GRAFICO,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.show()
+
+    print("\n--- RESUMO DOS EVENTOS POR ANO ---")
+    print(tabela_pivot)
+
+else:
+
+    print("❌ Falha crítica: Nenhum dado foi processado. Verifique as colunas e pastas.")
