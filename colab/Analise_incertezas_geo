@@ -1,0 +1,282 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from scipy import stats
+
+# ==============================================================================
+# CONFIGURAÇÕES
+# ==============================================================================
+OUT_FINAL = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+
+# Porcentagem de dados para usar nos gráficos (5% é suficiente para ver a tendência)
+AMOSTRA_FRAC = 0.05
+
+print("Iniciando Diagnóstico Profundo de Incertezas...")
+
+dfs_residuos = []
+pastas = [p for p in OUT_FINAL.iterdir() if p.is_dir()]
+
+# ==============================================================================
+# 1. GERAR RESÍDUOS (Amostragem Global)
+# ==============================================================================
+for i, pasta in enumerate(pastas):
+    # Pega apenas o primeiro arquivo parcial de cada micro para ser rápido
+    arquivo = next(pasta.glob("part_*.parquet"), None)
+    if not arquivo: continue
+
+    try:
+        print(f"[{i+1}/{len(pastas)}] Amostrando: {pasta.name}...", end=" ")
+        df = pd.read_parquet(arquivo)
+
+        # Filtra apenas dados reais para poder testar
+        mask_reais = df["lst"].notna()
+        indices_reais = df[mask_reais].index
+
+        if len(indices_reais) < 500:
+            print(" (Poucos dados)")
+            continue
+
+        # HOLD-OUT: Separa 20% para "fingir que não existe" e tentar adivinhar
+        np.random.seed(42)
+        indices_escondidos = np.random.choice(indices_reais, size=int(len(indices_reais) * 0.2), replace=False)
+
+        # Cria cópia para teste
+        df_teste = df.loc[indices_escondidos].copy()
+        y_real = df_teste["lst"].copy() # Guarda o gabarito
+
+        # Simula o buraco nos dados originais
+        df["lst_temp"] = df["lst"].copy()
+        df.loc[indices_escondidos, "lst_temp"] = np.nan
+
+        # Interpola (Recria o dado)
+        df = df.sort_values(["latitude", "longitude", "data"])
+        df["lst_reconst"] = df.groupby(["latitude", "longitude"])["lst_temp"].transform(
+            lambda x: x.interpolate(method="linear", limit=32)
+        )
+
+        # Recupera o valor interpolado apenas onde escondemos
+        y_est = df.loc[indices_escondidos, "lst_reconst"]
+
+        # Monta tabela de resíduos
+        temp_res = pd.DataFrame({
+            "Real": y_real,
+            "Estimado": y_est,
+            "Microrregiao": pasta.name,
+            "Mes": df_teste["data"].dt.month
+        })
+
+        # Remove nans (onde a interpolação não alcançou)
+        temp_res = temp_res.dropna()
+
+        # Calcula o Resíduo: (O quanto erramos)
+        # Positivo = Estimou pra cima (Superestimou)
+        # Negativo = Estimou pra baixo (Subestimou)
+        temp_res["Residuo"] = temp_res["Estimado"] - temp_res["Real"]
+
+        # Amostra aleatória para o gráfico não ficar pesado
+        if len(temp_res) > 100:
+            temp_res = temp_res.sample(frac=AMOSTRA_FRAC, random_state=42)
+
+        dfs_residuos.append(temp_res)
+        print("✔")
+
+    except Exception as e:
+        print(f"❌ {e}")
+
+# Junta todas as microrregiões num bandão só
+df_final = pd.concat(dfs_residuos, ignore_index=True)
+print(f"\n📊 Total de pontos amostrados para os gráficos: {len(df_final)}")
+
+# ==============================================================================
+# 2. CÁLCULO DE ESTATÍSTICAS GLOBAIS
+# ==============================================================================
+media_erro = df_final["Residuo"].mean()
+std_erro = df_final["Residuo"].std()
+
+# Intervalo de Confiança 95%
+ic_inf = media_erro - 1.96 * std_erro
+ic_sup = media_erro + 1.96 * std_erro
+
+print("\n" + "="*40)
+print("ESTATÍSTICAS DE INCERTEZA (GLOBAL)")
+print("="*40)
+print(f"Viés Médio (Bias): {media_erro:.4f} °C")
+print(f"Desvio Padrão:     {std_erro:.4f} °C")
+print(f"IC (95%):          [{ic_inf:.2f}, {ic_sup:.2f}]")
+print("="*40)
+
+# ==============================================================================
+# 3. GRÁFICOS DE DIAGNÓSTICO
+# ==============================================================================
+sns.set_style("whitegrid")
+fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+# A. Histograma (A "Forma" do erro)
+sns.histplot(df_final["Residuo"], kde=True, ax=axes[0, 0], color="skyblue", bins=50)
+axes[0, 0].set_title("A. Distribuição dos Erros")
+axes[0, 0].set_xlabel("Erro (°C)")
+axes[0, 0].axvline(0, color='r', linestyle='--')
+axes[0, 0].text(0.05, 0.9, f"Bias: {media_erro:.2f}\nIC95: {ic_inf:.1f} a {ic_sup:.1f}",
+                transform=axes[0, 0].transAxes, bbox=dict(facecolor='white', alpha=0.8))
+
+# B. Scatter Real vs Estimado
+# Usamos hexbin para ver onde está a densidade dos dados
+hb = axes[0, 1].hexbin(df_final["Real"], df_final["Estimado"], gridsize=40, cmap='Blues', mincnt=1)
+axes[0, 1].plot([df_final["Real"].min(), df_final["Real"].max()],
+                [df_final["Real"].min(), df_final["Real"].max()], 'r--', lw=2, label="1:1")
+axes[0, 1].set_title("B. Real vs Interpolado")
+axes[0, 1].set_xlabel("LST Real (°C)")
+axes[0, 1].set_ylabel("LST Interpolado (°C)")
+cb = plt.colorbar(hb, ax=axes[0, 1])
+cb.set_label("Contagem")
+
+# C. VIÉS CONDICIONAL (O mais importante para Ondas de Calor)
+# Mostra se erramos mais quando está muito quente
+sns.scatterplot(x=df_final["Real"], y=df_final["Residuo"], ax=axes[1, 0], alpha=0.1, color="purple", s=10)
+axes[1, 0].axhline(0, color='r', linestyle='--')
+axes[1, 0].set_title("C. Erro vs Temperatura Real (Viés Condicional)")
+axes[1, 0].set_xlabel("Temperatura Real (°C)")
+axes[1, 0].set_ylabel("Erro (Est - Real)")
+# Linha de tendência suave (Lowess)
+sns.regplot(x=df_final["Real"], y=df_final["Residuo"], ax=axes[1, 0],
+            scatter=False, color="red", lowess=True, line_kws={"linestyle":"-"})
+
+# D. Sazonalidade
+sns.boxplot(x="Mes", y="Residuo", data=df_final, ax=axes[1, 1], palette="coolwarm", showfliers=False)
+axes[1, 1].set_title("D. Erro por Mês")
+axes[1, 1].axhline(0, color='k', linestyle='--')
+
+plt.tight_layout()
+plt.show()
+
+import pandas as pd
+import numpy as np
+import os
+from pathlib import Path
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import gc
+
+# ==============================================================================
+# CONFIGURAÇÕES
+# ==============================================================================
+OUT_FINAL = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+ARQUIVO_RESUMO = OUT_FINAL / "RESUMO_VALIDACAO_COMPLETO.csv"
+
+print(f"📂 Varrendo microrregiões em: {OUT_FINAL}")
+
+# ==============================================================================
+# FUNÇÃO DE VALIDAÇÃO (HOLD-OUT)
+# ==============================================================================
+def validar_micro(pasta_micro):
+    # Pega o primeiro arquivo parcial encontrado
+    arquivo = next(pasta_micro.glob("part_*.parquet"), None)
+
+    if not arquivo:
+        return None
+
+    # Carrega dados
+    df = pd.read_parquet(arquivo)
+
+    # --- 1. PREPARAR O TESTE ---
+    # Filtra apenas dados reais
+    mask_reais = df["lst"].notna()
+    indices_reais = df[mask_reais].index
+
+    if len(indices_reais) < 100:
+        return None # Poucos dados para validar
+
+    # Sorteia 20% para esconder (Hold-Out)
+    np.random.seed(42)
+    indices_escondidos = np.random.choice(indices_reais, size=int(len(indices_reais) * 0.2), replace=False)
+
+    # Cria coluna de teste com buracos
+    df["lst_teste"] = df["lst"].copy()
+    df.loc[indices_escondidos, "lst_teste"] = np.nan
+
+    # --- 2. INTERPOLAR ---
+    # Ordena por espaço e tempo
+    df = df.sort_values(["latitude", "longitude", "data"])
+
+    # Interpolação Linear (Preenchendo os buracos)
+    df["lst_reconstruido"] = df.groupby(["latitude", "longitude"])["lst_teste"].transform(
+        lambda x: x.interpolate(method="linear", limit=32)
+    )
+
+    # --- 3. CALCULAR MÉTRICAS ---
+    # Filtra apenas onde escondemos o dado
+    df_val = df.loc[indices_escondidos].dropna(subset=["lst", "lst_reconstruido"])
+
+    if df_val.empty:
+        return None
+
+    y_real = df_val["lst"]
+    y_est = df_val["lst_reconstruido"]
+
+    # CÁLCULO DOS RESÍDUOS (AQUI ESTÁ A MUDANÇA)
+    # Resíduo = O quanto o modelo "errou"
+    # Positivo = Superestimou (Disse que era mais quente que o real)
+    # Negativo = Subestimou (Disse que era mais frio que o real)
+    residuos = y_est - y_real
+
+    return {
+        "Microrregiao": pasta_micro.name,
+        "MAE": mean_absolute_error(y_real, y_est),
+        "RMSE": np.sqrt(mean_squared_error(y_real, y_est)),
+        "Vies_Bias": np.mean(residuos),         # Média do erro (Viés)
+        "Desvio_Padrao_Erro": np.std(residuos), # Volatilidade do erro
+        "r": y_real.corr(y_est),                # Correlação
+        "N_Amostras": len(y_real)
+    }
+
+# ==============================================================================
+# EXECUÇÃO EM LOOP
+# ==============================================================================
+resultados = []
+pastas = [p for p in OUT_FINAL.iterdir() if p.is_dir()]
+
+print(f"📋 Encontradas {len(pastas)} pastas.")
+
+for i, pasta in enumerate(sorted(pastas)):
+    print(f"[{i+1}/{len(pastas)}] Validando: {pasta.name}...", end=" ")
+
+    try:
+        res = validar_micro(pasta)
+
+        if res:
+            resultados.append(res)
+            # Mostra na tela já formatado
+            print(f"✔ (RMSE: {res['RMSE']:.2f} | Viés: {res['Vies_Bias']:.2f} | Std: {res['Desvio_Padrao_Erro']:.2f})")
+        else:
+            print("⚠ (Dados insuficientes)")
+
+    except Exception as e:
+        print(f"❌ Erro: {e}")
+
+    gc.collect()
+
+# ==============================================================================
+# SALVAR E MOSTRAR
+# ==============================================================================
+if resultados:
+    # Cria o DataFrame final
+    df_resumo = pd.DataFrame(resultados)
+
+    # Ordena pelo RMSE (do pior para o melhor) para facilitar a análise
+    df_resumo = df_resumo.sort_values("RMSE", ascending=False)
+
+    # Salva CSV
+    df_resumo.to_csv(ARQUIVO_RESUMO, index=False)
+
+    print("\n" + "="*80)
+    print("📊 RESUMO DETALHADO DA VALIDAÇÃO (ORDENADO POR ERRO)")
+    print("="*80)
+    # Mostra colunas selecionadas e formatação bonita
+    pd.options.display.float_format = '{:,.3f}'.format
+    print(df_resumo[["Microrregiao", "RMSE", "Vies_Bias", "Desvio_Padrao_Erro", "r", "N_Amostras"]])
+
+    print("\n" + "="*80)
+    print(f"📁 Tabela completa salva em: {ARQUIVO_RESUMO}")
+else:
+    print("\n❌ Nenhum resultado gerado.")
