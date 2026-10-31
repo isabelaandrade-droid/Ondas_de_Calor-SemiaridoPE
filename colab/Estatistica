@@ -1,0 +1,428 @@
+CSV_OUT = os.path.join(OUT, "ESTATISTICAS")
+os.makedirs(CSV_OUT, exist_ok=True)
+
+VAR_ERA5 = ["tmax", "tmin"]
+
+def estatisticas_grupo(df, vars_interesse, grupo):
+    agg = {v: ['count','mean','median','min','max','std'] for v in vars_interesse if v in df.columns}
+    out = df.groupby(grupo).agg(agg)
+    out.columns = ["_".join(c) for c in out.columns]
+    return out.reset_index()
+
+# arquivos ERA5
+arquivos_era5 = glob(os.path.join(OUT, "ERA5_*.parquet"))
+
+csv_mr = os.path.join(CSV_OUT, "era5_microrregiao.csv")
+csv_mun = os.path.join(CSV_OUT, "era5_municipio.csv")
+
+for f in arquivos_era5:
+    print("📂 Processando:", os.path.basename(f))
+    df = pd.read_parquet(f)
+
+    microrregiao = os.path.basename(f).replace("ERA5_","").replace(".parquet","")
+    df["microrregiao"] = microrregiao
+
+    # microrregião
+    stat_mr = estatisticas_grupo(df, VAR_ERA5, "microrregiao")
+    stat_mr.to_csv(csv_mr, mode="a", header=not os.path.exists(csv_mr), index=False)
+
+    # município
+    if "municipio" in df.columns:
+        stat_mun = estatisticas_grupo(df, VAR_ERA5, "municipio")
+        stat_mun.to_csv(csv_mun, mode="a", header=not os.path.exists(csv_mun), index=False)
+
+    del df, stat_mr
+    gc.collect()
+
+print("✔ ERA5 estatísticas finalizadas sem estourar RAM")
+
+CSV_OUT = os.path.join(OUT, "ESTATISTICAS")
+os.makedirs(CSV_OUT, exist_ok=True)
+
+VAR_GRADE = ["evi", "lst", "albedo"]
+
+def estatisticas_descritivas(df, vars_interesse, grupo):
+    agg = {}
+    for v in vars_interesse:
+        if v in df.columns:
+            agg[v] = ["count", "mean", "median", "min", "max", "std"]
+
+    if not agg:
+        return None
+
+    df_stat = df.groupby(grupo).agg(agg)
+    df_stat.columns = ["_".join(col) for col in df_stat.columns]
+    return df_stat.reset_index()
+
+# Arquivos GRADE
+arquivos_grade = glob(os.path.join(OUT, "GRADE_*.parquet"))
+
+csv_mr = os.path.join(CSV_OUT, "grade_microrregiao.csv")
+csv_mun = os.path.join(CSV_OUT, "grade_municipio.csv")
+
+for f in arquivos_grade:
+    print(f"📂 Processando {os.path.basename(f)}")
+
+    df = pd.read_parquet(f)
+
+    microrregiao = (
+        os.path.basename(f)
+        .replace("GRADE_", "")
+        .replace(".parquet", "")
+        .replace("_padronizado", "")
+    )
+    df["microrregiao"] = microrregiao
+
+    # -------------------------
+    # Estatística por microrregião
+    # -------------------------
+    stat_mr = estatisticas_descritivas(df, VAR_GRADE, "microrregiao")
+    if stat_mr is not None:
+        stat_mr.to_csv(
+            csv_mr,
+            mode="a",
+            header=not os.path.exists(csv_mr),
+            index=False
+        )
+
+    # -------------------------
+    # Estatística por município
+    # -------------------------
+    if "municipio" in df.columns:
+        stat_mun = estatisticas_descritivas(df, VAR_GRADE, "municipio")
+        if stat_mun is not None:
+            stat_mun.to_csv(
+                csv_mun,
+                mode="a",
+                header=not os.path.exists(csv_mun),
+                index=False
+            )
+
+    # Limpeza de memória
+    del df, stat_mr
+    gc.collect()
+
+print("✔ Estatísticas da GRADE concluídas sem estourar RAM")
+
+OUT_OUTLIERS = os.path.join(OUT, "OUTLIERS", "GRADE")
+os.makedirs(OUT_OUTLIERS, exist_ok=True)
+
+VAR_GRADE = ["evi", "lst", "albedo"]
+
+def detectar_outliers_iqr(df, var):
+    q1 = df[var].quantile(0.25)
+    q3 = df[var].quantile(0.75)
+    iqr = q3 - q1
+    lim_inf = q1 - 1.5 * iqr
+    lim_sup = q3 + 1.5 * iqr
+    return df[(df[var] < lim_inf) | (df[var] > lim_sup)]
+
+arquivos_grade = glob(os.path.join(OUT, "GRADE_*.parquet"))
+
+for f in arquivos_grade:
+    print(f"📂 GRADE → {os.path.basename(f)}")
+    df = pd.read_parquet(f)
+
+    microrregiao = os.path.basename(f).replace("GRADE_", "").replace(".parquet", "")
+
+    for var in VAR_GRADE:
+        if var not in df.columns:
+            continue
+
+        df_var = df[[var]].dropna()
+        if df_var.empty:
+            continue
+
+        outliers = detectar_outliers_iqr(df_var, var)
+
+        if outliers.empty:
+            continue  # ❌ sem outliers → nada é salvo
+
+        # ---- Salvar CSV ----
+        csv_out = os.path.join(
+            OUT_OUTLIERS, f"outliers_{microrregiao}_{var}.csv"
+        )
+        outliers.to_csv(csv_out, index=False)
+
+        # ---- Boxplot ----
+        plt.figure()
+        plt.boxplot(df_var[var].values, vert=True)
+        plt.title(f"GRADE | {microrregiao} | {var}")
+        plt.ylabel(var)
+
+        fig_out = os.path.join(
+            OUT_OUTLIERS, f"boxplot_{microrregiao}_{var}.png"
+        )
+        plt.savefig(fig_out, dpi=200)
+        plt.close()
+
+        print(f"  ✔ Outliers detectados em {var}")
+
+    del df
+    gc.collect()
+
+print("✔ Outliers da GRADE finalizados")
+
+OUT_OUTLIERS = os.path.join(OUT, "OUTLIERS", "ERA5")
+os.makedirs(OUT_OUTLIERS, exist_ok=True)
+
+VAR_ERA5 = ["tmax", "tmin"]
+
+def detectar_outliers_iqr(df, var):
+    q1 = df[var].quantile(0.25)
+    q3 = df[var].quantile(0.75)
+    iqr = q3 - q1
+    lim_inf = q1 - 1.5 * iqr
+    lim_sup = q3 + 1.5 * iqr
+    return df[(df[var] < lim_inf) | (df[var] > lim_sup)]
+
+arquivos_era5 = glob(os.path.join(OUT, "ERA5_*.parquet"))
+
+for f in arquivos_era5:
+    print(f"📂 Processando ERA5 → {os.path.basename(f)}")
+    df = pd.read_parquet(f)
+
+    microrregiao = os.path.basename(f)\
+        .replace("ERA5_", "")\
+        .replace(".parquet", "")\
+        .replace("_padronizado", "")
+
+    for var in VAR_ERA5:
+        if var not in df.columns:
+            print(f"  ⚠ {var} não encontrado")
+            continue
+
+        df_var = df[[var]].dropna()
+        if df_var.empty:
+            continue
+
+        outliers = detectar_outliers_iqr(df_var, var)
+
+        if outliers.empty:
+            print(f"  ✔ Sem outliers em {var}")
+            continue
+
+        # -------- CSV --------
+        csv_out = os.path.join(
+            OUT_OUTLIERS,
+            f"outliers_{microrregiao}_{var}.csv"
+        )
+        outliers.to_csv(csv_out, index=False)
+
+        # -------- Boxplot --------
+        plt.figure()
+        plt.boxplot(df_var[var].values)
+        plt.title(f"ERA5 | {microrregiao} | {var}")
+        plt.ylabel("Temperatura (°C)")
+        plt.grid(False)
+
+        fig_out = os.path.join(
+            OUT_OUTLIERS,
+            f"boxplot_{microrregiao}_{var}.png"
+        )
+        plt.savefig(fig_out, dpi=200)
+        plt.close()
+
+        print(f"  ✔ Outliers detectados em {var}")
+
+    del df
+    gc.collect()
+
+print("✔ Outliers do ERA5 finalizados")
+
+OUT_OUTLIERS = os.path.join(OUT, "OUTLIERS", "GRADE")
+os.makedirs(OUT_OUTLIERS, exist_ok=True)
+
+VAR_GRADE = ["lst", "evi", "albedo"]
+
+def detectar_outliers_iqr(df, var):
+    q1 = df[var].quantile(0.25)
+    q3 = df[var].quantile(0.75)
+    iqr = q3 - q1
+    lim_inf = q1 - 1.5 * iqr
+    lim_sup = q3 + 1.5 * iqr
+    return df[(df[var] < lim_inf) | (df[var] > lim_sup)]
+
+arquivos_grade = glob(os.path.join(OUT, "GRADE_*.parquet"))
+
+for f in arquivos_grade:
+    print(f"\n📂 Processando {os.path.basename(f)}")
+
+    df = pd.read_parquet(f)
+
+    microrregiao = os.path.basename(f)\
+        .replace("GRADE_", "")\
+        .replace(".parquet", "")\
+        .replace("_padronizado", "")
+
+    if "uso_solo" not in df.columns:
+        print("⚠ coluna uso_solo ausente — pulando")
+        continue
+
+    for var in VAR_GRADE:
+        if var not in df.columns:
+            continue
+
+        df_var = df[[var, "uso_solo"]].dropna()
+        if df_var.empty:
+            continue
+
+        outliers = detectar_outliers_iqr(df_var, var)
+        if outliers.empty:
+            print(f"  ✔ Sem outliers em {var}")
+            continue
+
+        # deixar explícito
+        outliers = outliers.rename(columns={var: "valor_outlier"})
+
+        # cruzamento FINAL
+        cruz = (
+            outliers
+            .groupby(["valor_outlier", "uso_solo"])
+            .size()
+            .reset_index(name="n_outliers")
+            .sort_values("n_outliers", ascending=False)
+        )
+
+        csv_out = os.path.join(
+            OUT_OUTLIERS,
+            f"outliers_{var}_valor_x_uso_solo_{microrregiao}.csv"
+        )
+        cruz.to_csv(csv_out, index=False)
+
+        print(f"  ✔ {var}: valor_outlier × uso_solo salvo")
+
+    del df
+    gc.collect()
+
+print("\n✔ Cruzamento detalhado concluído")
+
+import numpy as np # Necessário para inserir NaN
+
+USO_SOLO_EXCLUIR = [22, 23, 24, 25, 26, 27, 30, 31, 33]
+
+def remover_outliers_grade(df, variaveis):
+    """
+    Substitui por NaN (não exclui a linha):
+    - LST < 8 ou > 48
+    - Outliers (IQR) apenas se uso_solo for indesejado
+    """
+    # Não usamos df.copy() aqui se quisermos economizar RAM,
+    # mas é seguro manter para não alterar o original sem querer.
+    df = df.copy()
+
+    # 1. Limpar LST fora do intervalo biológico (Substituir por NaN)
+    if "lst" in df.columns:
+        # A lógica é: Onde for menor que 8 OU maior que 48, vira NaN
+        mask_lst_ruim = (df["lst"] < 8) | (df["lst"] > 48)
+        df.loc[mask_lst_ruim, "lst"] = np.nan
+
+    # 2. Limpar outliers condicionais ao uso do solo
+    for v in variaveis:
+        if v not in df.columns:
+            continue
+
+        # Calcula IQR
+        q1 = df[v].quantile(0.25)
+        q3 = df[v].quantile(0.75)
+        iqr = q3 - q1
+
+        lim_inf = q1 - 1.5 * iqr
+        lim_sup = q3 + 1.5 * iqr
+
+        # Máscara do valor extremo
+        mask_outlier = (df[v] < lim_inf) | (df[v] > lim_sup)
+
+        if "uso_solo" in df.columns:
+            # Só remove se for outlier E estiver no uso de solo ruim
+            mask_remover = mask_outlier & df["uso_solo"].isin(USO_SOLO_EXCLUIR)
+
+            # AQUI ESTÁ A MÁGICA: Não deletamos a linha, anulamos o valor
+            if mask_remover.any():
+                df.loc[mask_remover, v] = np.nan
+
+    return df
+
+# ---------------------------------------------------------
+# EXECUÇÃO DA ESTATÍSTICA FINAL COM DADOS LIMPOS
+# ---------------------------------------------------------
+
+CSV_OUT = os.path.join(OUT, "ESTATISTICAS LIMPA")
+os.makedirs(CSV_OUT, exist_ok=True)
+
+VAR_GRADE = ["evi", "lst", "albedo"]
+
+def estatisticas_descritivas(df, vars_interesse, grupo):
+    agg = {}
+    for v in vars_interesse:
+        if v in df.columns:
+            # O Pandas ignora automaticamente os NaNs nos cálculos de média/std/min/max
+            agg[v] = ["count", "mean", "median", "min", "max", "std"]
+
+    if not agg:
+        return None
+
+    df_stat = df.groupby(grupo).agg(agg)
+    df_stat.columns = ["_".join(col) for col in df_stat.columns]
+    return df_stat.reset_index()
+
+arquivos_grade = glob(os.path.join(OUT, "GRADE_*.parquet"))
+
+csv_mr = os.path.join(CSV_OUT, "grade_microrregiao.csv")
+csv_mun = os.path.join(CSV_OUT, "grade_municipio.csv")
+
+# Apagar arquivos antigos para garantir que não duplique ao rodar de novo
+for arq in [csv_mr, csv_mun]:
+    if os.path.exists(arq):
+        os.remove(arq)
+
+for f in arquivos_grade:
+    print(f"📂 Processando {os.path.basename(f)}")
+
+    df = pd.read_parquet(f)
+
+    microrregiao = (
+        os.path.basename(f)
+        .replace("GRADE_", "")
+        .replace(".parquet", "")
+        .replace("_padronizado", "")
+    )
+    df["microrregiao"] = microrregiao
+
+    # 🔥 LIMPEZA: Agora substitui valores ruins por NaN, mantendo a linha
+    df = remover_outliers_grade(df, VAR_GRADE)
+
+    # -------------------------
+    # Microrregião
+    # -------------------------
+    stat_mr = estatisticas_descritivas(df, VAR_GRADE, "microrregiao")
+    if stat_mr is not None:
+        stat_mr.to_csv(
+            csv_mr,
+            mode="a",
+            header=not os.path.exists(csv_mr),
+            index=False
+        )
+
+    # -------------------------
+    # Município
+    # -------------------------
+    if "municipio" in df.columns:
+        stat_mun = estatisticas_descritivas(df, VAR_GRADE, "municipio")
+        if stat_mun is not None:
+            stat_mun.to_csv(
+                csv_mun,
+                mode="a",
+                header=not os.path.exists(csv_mun),
+                index=False
+            )
+
+    # LIMPAR MEMÓRIA
+    del df, stat_mr
+    if 'stat_mun' in locals(): del stat_mun
+    gc.collect()
+
+print("✔ Estatísticas da GRADE refeitas (Células de outliers substituídas por NaN)")
+
+
+
