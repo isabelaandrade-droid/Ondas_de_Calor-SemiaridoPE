@@ -1,0 +1,587 @@
+// =============================== //
+//        CARREGAR SHAPEFILE       //
+// =============================== //
+// Mostrar a área do semiárido de PE assim que o mapa for carregado
+Map.centerObject(roi, 8); // Ajuste o valor de zoom conforme necessário
+Map.addLayer(roi, {color: 'lightgreen'}, 'Semiárido de PE');
+
+// =========================================== //
+//        TRATAR AS IMAGENS DE SATÉLITES       //
+// =========================================== //
+// Função para mascarar nuvens e sombras de nuvens usando a banda QA_PIXEL
+function maskClouds(image) {
+  var qa = image.select('QA_PIXEL'); // Seleciona a banda de qualidade
+
+  // Máscara para nuvens (bits 3 e 4) e sombras de nuvens (bit 5)
+  var cloudMask = qa.bitwiseAnd(1 << 3).eq(0) // Bit 3: Nuvens - realiza uma operação de deslocamento de bits, buscando o bit 3 (que representa a nuvem). A operação eq(0) verifica se o valor desse bit é 0, ou seja, o pixel não está coberto por nuvem.
+             .and(qa.bitwiseAnd(1 << 4).eq(0)) // Bit 4: Nuvens de alta confiança
+             .and(qa.bitwiseAnd(1 << 5).eq(0)); // Bit 5: Sombras de nuvens
+
+  return image.updateMask(cloudMask); // Aplica a máscara
+}
+
+// Função para carregar imagens Landsat
+function carregarColecaoLandsat() {
+  if (!roi) {
+    print('Área de interesse não definida.');
+    return ee.ImageCollection([]);
+  }
+  
+  var colecoes = [
+    {id: 'LANDSAT/LT05/C02/T1_TOA', inicio: '1994-01-01', fim: '2023-12-31'},
+    {id: 'LANDSAT/LC08/C02/T1_TOA', inicio: '1994-01-01', fim: '2023-12-31'},
+    {id: 'LANDSAT/LC09/C02/T1_TOA', inicio: '1994-01-01', fim: '2023-12-31'}
+  ];
+
+  // Criar um array de coleções de imagens mescladas
+var colecoesMescladas = colecoes.map(function(colecao) {
+    var colecaoFiltrada = ee.ImageCollection(colecao.id)
+      .filterBounds(roi)
+      .map(maskClouds)
+      .map(function(img) { return img.clip(roi); });
+    
+    return colecaoFiltrada;
+});
+  
+// Coleções L5 e L9 combinadas para garantir a continuidade da série temporal
+return ee.ImageCollection(colecoesMescladas[0])
+                   .merge(colecoesMescladas[1])
+                   .merge(colecoesMescladas[2]);
+}
+
+// ************************************************************* //
+//       AINDA HÁ UMA LACUNA DE 08/11/2011 A 18/03/2013.
+//                   FALHA NO SLC DO LANDSAT 7 
+// ************************************************************* //
+
+// ============================= //
+//              ALBEDO           //
+// ============================= //
+
+// Função para calcular o Albedo dependendo do satélite
+function adicionarAlbedo(image) {
+  // Fórmula para Landsat 5 TM
+  var albedoL5 = image.expression(
+    '0.356*B1 + 0.130*B3 + 0.373*B4 + 0.085*B5 + 0.072*B7 - 0.0018', {
+      'B1': image.select('B1'),
+      'B3': image.select('B3'),
+      'B4': image.select('B4'),
+      'B5': image.select('B5'),
+      'B7': image.select('B7')
+    }).rename('albedo');
+
+  // Fórmula para Landsat 9
+  var albedoL89 = image.expression(
+    '0.300*B2 + 0.278*B4 + 0.233*B5 + 0.143*B6 + 0.036*B7 - 0.018', {
+      'B2': image.select('B2'),
+      'B4': image.select('B4'),
+      'B5': image.select('B5'),
+      'B6': image.select('B6'),
+      'B7': image.select('B7')
+    }).rename('albedo');
+
+  // Verifica se é Landsat 5 ou 8 usando .compareTo(…) == 0
+  var id = ee.String(image.get('SPACECRAFT_ID'));
+  var albedo = ee.Image(ee.Algorithms.If(
+                        id.compareTo('LANDSAT_5')
+                          .eq(0), albedoL5,
+    
+                        ee.Algorithms.If(id.compareTo('LANDSAT_8')
+                          .eq(0)
+                          .or(id.compareTo('LANDSAT_9')
+                          .eq(0)), albedoL89, 
+               
+               ee.Image(0).rename('albedo'))
+  ));
+
+  return image.addBands(albedo);
+}
+
+// =============================== //
+//    PADRONIZAÇÃO DE BANDAS       //
+// =============================== //
+// Função para padronizar as bandas do Landsat 5 e 8
+function padronizarBandas(image) {
+  var sat = ee.String(image.get('SPACECRAFT_ID'));
+
+  var isL5 = sat.compareTo('LANDSAT_5').eq(0);
+  var isL8or9 = sat.compareTo('LANDSAT_8').eq(0).or(sat.compareTo('LANDSAT_9').eq(0));
+
+  var nir = ee.Image(ee.Algorithms
+                       .If(isL5, image.select('B4'), image.select('B5')))
+                       .rename('NIR');
+                       
+  var red = ee.Image(ee.Algorithms
+                       .If(isL5, image.select('B3'), image.select('B4')))
+                       .rename('RED');
+  
+  var blue = ee.Image(ee.Algorithms
+                       .If(isL5, image.select('B1'), image.select('B2')))
+                       .rename('BLUE');
+                       
+  var green = ee.Image(ee.Algorithms
+                         .If(isL5, image.select('B2'), image.select('B3')))
+                         .rename('GREEN');
+
+  var thermal = ee.Image(ee.Algorithms
+                         .If(isL5, image.select('B6'), image.select('B10')))
+                         .rename('TERMAL');
+
+return image.addBands([nir, red, blue, green, thermal])
+            .select(['NIR', 'RED', 'BLUE', 'GREEN', 'TERMAL', 'albedo']);
+
+}
+
+
+// Carregar a coleção de imagens antes de realizar o mapeamento
+var imageCollection = carregarColecaoLandsat();
+
+print('Nº de imagens após filtro:', imageCollection.size());
+
+
+// =========================================== //
+//              FUNÇÕES AUXILIARES             //
+// =========================================== //
+
+// **************** //
+//        EVI       //
+// **************** //
+
+// Função para calcular EVI
+function calcularEVI(image) {
+  var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select('NIR'),
+      'RED': image.select('RED'),
+      'BLUE': image.select('BLUE')
+    }).rename('EVI');
+
+  return image.addBands(evi)
+              .set('year', image.date().get('year'))
+              .set('month', image.date().get('month'));
+}
+
+// ******************************** //
+//        FRAÇÃO DA VEGETAÇÃO       //
+// ******************************** //
+
+// Calcular EVI min e max globalmente
+var colecaoBase1 = carregarColecaoLandsat()
+  .map(maskClouds)
+  .map(adicionarAlbedo)       // calcula albedo com bandas originais
+  .map(padronizarBandas)      // adiciona bandas padronizadas e mantém o albedo
+  .map(calcularEVI)
+  .map(function(img) {
+      var evi = img.select('EVI');
+  // Máscara para manter só valores plausíveis entre -1 e 1
+      var mask = evi.gte(-1).and(evi.lte(1));
+      return img.updateMask(mask);
+});
+
+// Compor imagem mínima e máxima da banda EVI (mínimo absoluto e máximo absoluto)
+var eviMinImg = colecaoBase1.select('EVI').min().rename('EVI_min');
+var eviMaxImg = colecaoBase1.select('EVI').max().rename('EVI_max');
+
+var eviMinDict = eviMinImg.reduceRegion({
+  reducer: ee.Reducer.min(),
+  geometry: roi,
+  scale: 500,
+  maxPixels: 1e13,
+  bestEffort: true,
+  tileScale: 4
+});
+
+var eviMaxDict = eviMaxImg.reduceRegion({
+  reducer: ee.Reducer.max(),
+  geometry: roi,
+  scale: 500,
+  maxPixels: 1e13,
+  bestEffort: true,
+  tileScale: 4
+});
+
+var eviMin = ee.Number(eviMinDict.get('EVI_min'));
+var eviMax = ee.Number(eviMaxDict.get('EVI_max'));
+
+print('EVI mínimo:', eviMin);
+print('EVI máximo:', eviMax);
+
+
+// Função para calcular Pv (limitar para evitar valores fora do intervalo)
+function calcularPv(image) {
+  var pv = image.expression(
+    '((EVI - eviMin) / (eviMax - eviMin)) ** 2', {
+      'EVI': image.select('EVI'),
+      'eviMin': eviMin,
+      'eviMax': eviMax
+    }).rename('pv')
+      .clamp(0, 1);
+  
+  // Limita pv para o intervalo [0,1]
+  //pv = pv.where(pv.lt(0), 0).where(pv.gt(1), 1);
+  
+  return image.addBands(pv)
+              .set('year', image.date().get('year'))
+              .set('month', image.date().get('month'));
+}
+
+// ************************* //
+//        EMISSIVIDADE       //
+// ************************* //
+
+// Função para calcular emissividade
+function calcularEmissividade(image) {
+  var pv = image.select('pv');
+  
+  // Calcular emissividade       
+  var emissividade = image.expression(
+    '0.004 * pv + 0.986', {
+      'pv': pv
+  }).rename('emissividade');
+
+  return image.addBands(emissividade)
+              .set('year', image.date().get('year'))
+              .set('month', image.date().get('month'));
+}
+
+// **************** //
+//        LST       //
+// **************** //
+
+// Função para calcular LST
+function calcularLST(image) {
+  var lst = image.expression(
+  '(BT / (1 + (10.8 * (BT / 14380)) * log(emiss))) - 273.15', {
+  'BT': image.select('TERMAL'),  // Aqui usamos 'TERMAL' e não 'B10' ou 'B6'
+  'emiss': image.select('emissividade')
+  }).rename('LST');
+    
+  return image.addBands(lst)
+              .set('year', image.date().get('year'))
+              .set('month', image.date().get('month'));
+}
+
+
+print('colecaoBase1 first bandNames:', colecaoBase1.first().bandNames());
+
+
+
+var colecaoBase2 = colecaoBase1
+  .map(calcularPv)
+  .map(calcularEmissividade)
+  .map(calcularLST);
+  
+print('colecaoBase2 first bandNames:', colecaoBase2.first().bandNames());
+
+
+// =============================== //
+//   EXPORTAR TODAS AS VARIÁVEIS   //
+// =============================== //
+
+// Carregar uso do solo
+var usoSolo = uso.clip(roi)
+                 .select('b1')
+                 .rename('uso_solo');
+
+// =============================== //
+// EXPORTAÇÃO POR MICRORREGIÃO 
+// =============================== //
+
+// Lista de microrregiões únicas
+var listaMicros = roi.aggregate_array('NM_MICRO').distinct();
+
+// Tamanho da célula da grade (em metros)
+var tamanhoCelula = 1000;
+
+// Função para normalizar nomes de microrregiões e municípios
+function normalizarNome(nome) {
+  // Converte pra texto simples se vier de ee.String
+  if (nome instanceof ee.String) {
+    nome = nome.getInfo(); // executa só fora do loop server-side
+  }
+
+  // Tabela de substituições (regex global)
+  var mapa = {
+    'á':'a','ã':'a','â':'a','à':'a',
+    'Á':'A','Ã':'A','Â':'A','À':'A',
+    'é':'e','ê':'e','É':'E','Ê':'E',
+    'í':'i','Í':'I',
+    'ó':'o','õ':'o','ô':'o','Ó':'O','Õ':'O','Ô':'O',
+    'ú':'u','ü':'u','Ú':'U','Ü':'U',
+    'ç':'c','Ç':'C'
+  };
+
+  // Substitui todos os acentos
+  for (var k in mapa) {
+    var regex = new RegExp(k, 'g');
+    nome = nome.replace(regex, mapa[k]);
+  }
+
+  // Troca espaços e traços por "_"
+  nome = nome.replace(/[\s-]+/g, '_');
+
+  return nome;
+}
+
+
+// ========================================= //
+// FUNÇÃO: GRADE DE PONTOS
+// ========================================= //
+function gerarGrade(geom, tamanhoCelula) {
+  var bounds = geom.bounds();
+  var grad = ee.Image.pixelLonLat()
+                .sample({
+                  region: geom,
+                  scale: tamanhoCelula,
+                  projection: 'EPSG:4326',
+                  geometries: true
+                });
+  grad = ee.Algorithms.If(
+    grad.size().eq(0),
+    ee.FeatureCollection([ee.Feature(geom.centroid())]),
+    grad
+  );
+  return ee.FeatureCollection(grade);
+}
+
+// ===============================
+// GRADE FIXA 1 km x 1 km
+// ===============================
+
+var tamanhoCelula = 1000; // metros
+
+var gradeFixa = ee.Image.pixelLonLat()
+  .sample({
+    region: roi.geometry(),
+    scale: tamanhoCelula,
+    projection: 'EPSG:4326',
+    geometries: true
+  })
+  .map(function(f) {
+    return f.set('pixel_id', f.id());
+  });
+
+print('Grade fixa:', gradeFixa.limit(5));
+print('Total de pixels:', gradeFixa.size());
+
+Export.table.toAsset({
+  collection: gradeFixa,
+  description: 'grade_fixa_1km_semiarido',
+  assetId: 'projects/disserta-432520/assets/grade_fixa'
+});
+
+
+// ================================================= //
+// EXPORTAÇÃO FINAL POR MICRORREGIÃO-MUNICÍPIO + ANO
+// ================================================= //
+
+var exportarMunicipioAno = function(nomeMicro, nomeMunicipio) {
+
+  var feicaoMunicipio = roi.filter(ee.Filter.eq('NM_MICRO', nomeMicro))
+                           .filter(ee.Filter.eq('NM_MUNICIP', nomeMunicipio));
+  var geomMunicipio = feicaoMunicipio.geometry();
+
+  // Gerar grade por município
+  var grad = gradeFixa.filterBounds(geomMunicipio);
+
+  var colecaoMunicipio = colecaoBase2.filterBounds(geomMunicipio);
+  var ano = ee.List.sequence(1994, 2023);
+
+  ano.getInfo().forEach(function(ano) {
+    
+    var colecaoAno = colecaoMunicipio.filter(ee.Filter.calendarRange(ano, ano, 'year'));
+
+      var todasAmostras = colecaoAno.map(function(image){
+        var data = ee.Date(image.get('system:time_start'));
+        var horaUTC = data.get('hour'); // Adiciona a hora
+
+        // Converter UTC para horário local (Brasília: UTC-3)
+        var horaLocal = ee.Number(horaUTC).subtract(3).mod(24);
+
+        // Classificar como manhã, tarde ou noite
+        var periodo = ee.String(ee.Algorithms.If(
+          horaLocal.lte(12), 'Matutino',
+          ee.Algorithms.If(horaLocal.lte(17), 'Vespertino', 'Noturno')
+        ));
+
+        return image.select(['EVI','LST','albedo'])
+                    .addBands(usoSolo)
+                    .sampleRegions({
+                      collection: grad,
+                      scale: 30,
+                      geometries: true
+                    })
+                    .map(function(f){
+                      return f
+                              .set('pixel_id', f.get('pixel_id'))
+                              .set('dia', data.get('day'))
+                              .set('mes', data.get('month'))
+                              .set('ano', data.get('year'))
+                              .set('hora_local', horaLocal)
+                              .set('periodo', periodo)
+                              .set('microrregiao', nomeMicro)
+                              .set('municipio', nomeMunicipio);
+                    });
+      }).flatten();
+
+      var nomeMicroNorm = normalizarNome(nomeMicro);
+      var nomeMunicipioNorm = normalizarNome(nomeMunicipio);
+
+      Export.table.toDrive({
+        collection: todasAmostras,
+        description: 'GradePixel_' + nomeMicroNorm + '_' + nomeMunicipioNorm + '_' + ano,
+        fileFormat: 'CSV'
+      });
+  
+    });
+  };
+
+
+// ========================================= //
+// LOOP GERAL (MICRORREGIÃO → MUNICÍPIO)
+// ========================================= //
+
+listaMicros.evaluate(function(micros){
+  micros.forEach(function(nomeMicro){
+    var listaMunicipios = roi.filter(ee.Filter.eq('NM_MICRO', nomeMicro))
+                             .aggregate_array('NM_MUNICIP')
+                             .distinct();
+    listaMunicipios.evaluate(function(municipios){
+      municipios.forEach(function(nomeMunicipio){
+        exportarMunicipioAno(nomeMicro, nomeMunicipio);
+      });
+    });
+  });
+});
+
+
+// =============================== //
+//    OUTROS DADOS CLIMÁTICOS      //
+// =============================== //
+
+// ERA5 Daily Aggregates (1994-2023)
+var era5_1 = ee.ImageCollection("ECMWF/ERA5/DAILY")
+  .filterDate('1994-01-01', '2023-12-31')
+  .filterBounds(roi)
+  .select(['maximum_2m_air_temperature', 'minimum_2m_air_temperature']);
+
+// ERA5-land (1994-2023)
+var era5_2 = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+  .filterDate('2021-01-01', '2023-12-31')
+  .filterBounds(roi)
+  .select(['temperature_2m_max', 'temperature_2m_min'])
+  // renomear para manter consistência
+  .map(function(img) {
+    return img
+      .rename(['maximum_2m_air_temperature', 'minimum_2m_air_temperature'])
+      .copyProperties(img, img.propertyNames());
+  });
+
+// Mesclar as duas coleções
+var era5 = era5_1.merge(era5_2);
+
+//converer para ºC + DATA/HORA
+
+era5 = era5.map(function(img){
+  var tmax = img.select('maximum_2m_air_temperature')
+                .subtract(273.15).rename('tmax_C');
+  
+  var tmin = img.select('minimum_2m_air_temperature')
+                .subtract(273.15).rename('tmin_C');
+  
+  var data = ee.Date(img.get('system:time_start'));
+  var horaUTC = data.get('hour');
+  var horaLocal = ee.Number(horaUTC).subtract(3).mod(24);
+  var periodo = ee.String(ee.Algorithms.If(
+    horaLocal.lte(12), 'Matutino',
+    ee.Algorithms.If(horaLocal.lte(17), 'Vespertino', 'Noturno')
+  ));
+  
+  return img.addBands([tmax, tmin])
+            .set('hora_local', horaLocal)
+            .set('periodo', periodo)
+            .set('ano', data.get('year'))
+            .set('mes', data.get('month'))
+            .set('dia', data.get('day'))
+            .copyProperties(img, img.propertyNames());
+});
+
+
+
+
+// ==================================================== //
+// EXPORTAÇÃO ERA5 POR MICRORREGIÃO + MUNICÍPIO + ANO   //
+// ==================================================== //
+function exportarERA5_MicroMunicipio(nomeMicro, nomeMunicipio) {
+  var feicao = roi.filter(ee.Filter.eq('NM_MICRO', nomeMicro))
+                  .filter(ee.Filter.eq('NM_MUNICIP', nomeMunicipio));
+  var geom = feicao.geometry();
+
+  var grade = gradeFixa.filterBounds(geom); //
+  var colecaoLocal = era5.filterBounds(geom);
+  var ano = ee.List.sequence(1994, 2023);
+
+  ano.evaluate(function(listaAnos){
+    listaAnos.forEach(function(ano){
+      var colecaoAno = colecaoLocal.filter(ee.Filter.calendarRange(ano, ano, 'year'));
+
+      var amostras = colecaoAno.map(function(image){
+        var data = ee.Date(image.get('system:time_start'));
+        var horaUTC = data.get('hour'); // Adiciona a hora
+        
+        // Converter UTC para horário local (Brasília: UTC-3)
+        var horaLocal = ee.Number(horaUTC).subtract(3).mod(24);
+        
+        // Classificar como manhã, tarde ou noite
+        var periodo = ee.String(ee.Algorithms.If(
+          horaLocal.lte(12), 'Matutino',
+          ee.Algorithms.If(horaLocal.lte(18), 'Vespertino', 'Noturno')
+        ));
+
+        
+        return image.select(['tmax_C','tmin_C'])
+                  .sampleRegions({
+                    collection: grade,
+                    scale: 11100,
+                    geometries: true
+                  })
+                  .map(function(f){
+                    return f
+                              .set('pixel_id', f.get('pixel_id'))
+                              .set('dia', data.get('day'))
+                              .set('mes', data.get('month'))
+                              .set('ano', data.get('year'))
+                              .set('hora_local', horaLocal)
+                              .set('periodo', periodo)
+                              .set('microrregiao', nomeMicro)
+                              .set('municipio', nomeMunicipio);
+                  });
+      }).flatten();
+      
+      var nomeMicroNorm = normalizarNome(nomeMicro);
+      var nomeMunicipioNorm = normalizarNome(nomeMunicipio);
+
+      Export.table.toDrive({
+        collection: amostras,
+        description: 'ERA5_TempAr_' + nomeMicroNorm + '_' + nomeMunicipioNorm + '_' + ano,
+        fileFormat: 'CSV'
+      });
+    });
+  });
+}
+
+// ==================================================== //
+// LOOP PRINCIPAL - MICRORREGIÃO → MUNICÍPIO
+// ==================================================== //
+listaMicros.evaluate(function(micros){
+  micros.forEach(function(nomeMicro){
+    var listaMunicipios = roi.filter(ee.Filter.eq('NM_MICRO', nomeMicro))
+                             .aggregate_array('NM_MUNICIP')
+                             .distinct();
+    listaMunicipios.evaluate(function(municipios){
+      municipios.forEach(function(nomeMunicipio){
+        exportarERA5_MicroMunicipio(nomeMicro, nomeMunicipio);
+      });
+    });
+  });
+});
