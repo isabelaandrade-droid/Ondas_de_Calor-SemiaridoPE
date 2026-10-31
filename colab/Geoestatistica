@@ -1,0 +1,354 @@
+import pandas as pd
+import numpy as np
+import os
+from pathlib import Path
+from sklearn.neighbors import BallTree
+import gc
+
+# ==============================================================================
+# CONFIGURAÇÕES
+# ==============================================================================
+OUT = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET")
+ERA_DIR = OUT
+GRADE_DIR = OUT
+OUT_FINAL = OUT / "SAIDA_FINAL"
+OUT_FINAL.mkdir(exist_ok=True)
+
+DATA_INICIO = "1994-01-01"
+DATA_FIM = "2023-12-31"
+
+PIXELS_POR_LOTE = 1000
+
+print(f"📂 Diretório de Saída: {OUT_FINAL}")
+print("ℹ Modo: Salvamento Particionado (Big Data Style)")
+
+# ==============================================================================
+# 1. FUNÇÕES AUXILIARES
+# ==============================================================================
+
+def norm(nome):
+    return nome.upper().replace("_", " ").strip()
+
+def get_arquivo(pasta, prefixo, microrregiao):
+    mic = norm(microrregiao)
+    for f in pasta.glob(f"{prefixo}_*.parquet"):
+        nome_limpo = norm(f.stem.replace(prefixo + "_", "").replace("_padronizado", ""))
+        if nome_limpo == mic:
+            return f
+    return None
+
+def otimizar_tipos(df):
+    """Reduz o consumo de memória drasticamente"""
+    for col in df.columns:
+        if df[col].dtype == 'float64':
+            df[col] = df[col].astype('float32')
+        if df[col].dtype == 'int64':
+            df[col] = df[col].astype('int32')
+    return df
+
+def criar_esqueleto_lote(locais_lote, data_inicio, data_fim):
+    """Cria o esqueleto temporal"""
+    todas_datas = pd.date_range(start=data_inicio, end=data_fim, freq="D")
+
+    locais_lote = locais_lote.copy()
+    locais_lote["_key"] = 1
+
+    df_datas = pd.DataFrame({"data": todas_datas, "_key": 1})
+
+    # Otimização extrema para o merge
+    df_datas["_key"] = df_datas["_key"].astype('int8')
+    locais_lote["_key"] = locais_lote["_key"].astype('int8')
+
+    esqueleto = pd.merge(locais_lote, df_datas, on="_key").drop("_key", axis=1)
+    return esqueleto
+
+def parear_era5_otimizado(df_esqueleto, df_era5):
+    # 1. Remove NaNs de coordenadas
+    locais_grade = df_esqueleto[["latitude", "longitude"]].drop_duplicates().dropna()
+    locais_era = df_era5[["latitude", "longitude"]].drop_duplicates().dropna()
+
+    if locais_grade.empty or locais_era.empty:
+        return df_esqueleto
+
+    # 2. BallTree
+    coords_grade = np.deg2rad(locais_grade[["latitude", "longitude"]].values)
+    coords_era = np.deg2rad(locais_era[["latitude", "longitude"]].values)
+
+    tree = BallTree(coords_era, metric="haversine")
+    dist, idx = tree.query(coords_grade, k=1)
+
+    # Mapeamento
+    locais_grade["lat_era"] = locais_era.iloc[idx[:, 0]]["latitude"].values
+    locais_grade["lon_era"] = locais_era.iloc[idx[:, 0]]["longitude"].values
+
+    # Merge mapeamento
+    df_esqueleto = pd.merge(df_esqueleto, locais_grade, on=["latitude", "longitude"], how="left")
+
+    # Merge dados ERA5
+    cols_era = ["data", "latitude", "longitude", "tmax", "tmin"]
+    cols_era = [c for c in cols_era if c in df_era5.columns]
+
+    df_era_renamed = df_era5[cols_era].rename(columns={"latitude": "lat_era", "longitude": "lon_era"})
+
+    df_final = pd.merge(
+        df_esqueleto,
+        df_era_renamed,
+        on=["data", "lat_era", "lon_era"],
+        how="left"
+    )
+
+    if "lat_era" in df_final.columns:
+        df_final = df_final.drop(columns=["lat_era", "lon_era"])
+
+    return df_final
+
+# ==============================================================================
+# 2. PIPELINE PARTICIONADO
+# ==============================================================================
+
+def pipeline_por_lote(microrregiao):
+    print(f"\n🚀 Iniciando: {microrregiao}")
+
+    path_grade = get_arquivo(GRADE_DIR, "GRADE", microrregiao)
+    path_era5 = get_arquivo(ERA_DIR, "ERA5", microrregiao)
+
+    if not path_grade or not path_era5:
+        print(f"❌ Arquivos não encontrados para {microrregiao}")
+        return
+
+    # --- 1. CARREGAR DADOS ---
+    try:
+        df_grade = pd.read_parquet(path_grade)
+        df_grade["data"] = pd.to_datetime(df_grade["data"])
+        df_grade = df_grade.dropna(subset=["latitude", "longitude"])
+        df_grade = otimizar_tipos(df_grade)
+
+        df_era5 = pd.read_parquet(path_era5)
+        df_era5["data"] = pd.to_datetime(df_era5["data"])
+        df_era5 = df_era5.dropna(subset=["latitude", "longitude"])
+        df_era5 = otimizar_tipos(df_era5)
+
+    except Exception as e:
+        print(f"❌ Erro ao ler arquivos: {e}")
+        return
+
+    # --- 2. PREPARAR PASTA DE SAÍDA ---
+    # Cria uma pasta exclusiva para a microrregião (ex: SAIDA_FINAL/ALTO_CAPIBARIBE)
+    pasta_micro = OUT_FINAL / microrregiao.replace(" ", "_")
+    pasta_micro.mkdir(exist_ok=True)
+
+    # --- 3. PREPARAR LOTES ---
+    cols_estaticas = ["latitude", "longitude", "municipio", "microrregiao", ".geo"]
+    if "uso_solo" in df_grade.columns: cols_estaticas.append("uso_solo")
+    cols_presentes = [c for c in cols_estaticas if c in df_grade.columns]
+
+    locais_unicos = df_grade[cols_presentes].drop_duplicates().reset_index(drop=True)
+    total_pixels = len(locais_unicos)
+
+    if total_pixels == 0: return
+
+    num_lotes = int(np.ceil(total_pixels / PIXELS_POR_LOTE))
+
+    print(f"   📊 Pixels: {total_pixels} | Lotes: {num_lotes}")
+    print(f"   📂 Salvando em: {pasta_micro.name}/")
+
+    d_ini = max(pd.to_datetime(DATA_INICIO), df_grade["data"].min())
+    d_fim = min(pd.to_datetime(DATA_FIM), df_era5["data"].max())
+
+    # --- 4. LOOP POR LOTE ---
+    for i in range(num_lotes):
+        caminho_part = pasta_micro / f"part_{i}.parquet"
+
+        # Se já existe, pula (bom para retomar se cair a conexão)
+        if caminho_part.exists():
+            print(f"   ⏭ Lote {i+1}/{num_lotes} já existe. Pulando.")
+            continue
+
+        try:
+            inicio = i * PIXELS_POR_LOTE
+            fim = inicio + PIXELS_POR_LOTE
+            lote_locais = locais_unicos.iloc[inicio:fim].copy()
+
+            print(f"   🔄 Processando {i+1}/{num_lotes}...", end="\r")
+
+            # A. Esqueleto
+            df_esqueleto = criar_esqueleto_lote(lote_locais, d_ini, d_fim)
+
+            # B. Merge GRADE
+            lote_lat = lote_locais["latitude"].unique()
+            lote_lon = lote_locais["longitude"].unique()
+
+            df_grade_filt = df_grade[
+                df_grade["latitude"].isin(lote_lat) &
+                df_grade["longitude"].isin(lote_lon)
+            ]
+
+            cols_dados = ["data", "latitude", "longitude", "lst", "evi"]
+            cols_dados = [c for c in cols_dados if c in df_grade.columns]
+
+            df_lote = pd.merge(df_esqueleto, df_grade_filt[cols_dados], on=["data", "latitude", "longitude"], how="left")
+
+            # C. Merge ERA5
+            df_lote = parear_era5_otimizado(df_lote, df_era5)
+
+            # D. Interpolação (Linear = Time quando o index é regular)
+            df_lote = df_lote.sort_values(["latitude", "longitude", "data"])
+
+            df_lote["lst_interp"] = df_lote.groupby(["latitude", "longitude"])["lst"].transform(
+                lambda x: x.interpolate(method="linear", limit=32)
+            )
+
+            # Flags
+            df_lote["flag_dado"] = np.where(df_lote["lst"].notna(), "REAL",
+                                   np.where(df_lote["lst_interp"].notna(), "INTERPOLADO", "VAZIO"))
+
+            # E. Salvar PARTIÇÃO
+            df_lote = otimizar_tipos(df_lote)
+            df_lote.to_parquet(caminho_part, index=False)
+
+            # Limpeza
+            del df_esqueleto, df_lote, df_grade_filt
+            gc.collect()
+
+        except Exception as e:
+            print(f"\n❌ Erro no lote {i+1}: {e}")
+            continue
+
+    print(f"\n   ✔ {microrregiao} finalizada!")
+    del df_grade, df_era5
+    gc.collect()
+
+# ==============================================================================
+# 3. EXECUÇÃO
+# ==============================================================================
+
+micros_disponiveis = sorted([
+    f.stem.replace("ERA5_", "").replace(".parquet", "")
+    for f in ERA_DIR.glob("ERA5_*.parquet")
+])
+
+print(f"📋 Encontradas {len(micros_disponiveis)} microrregiões.")
+
+for mic in micros_disponiveis:
+    pipeline_por_lote(mic)
+
+
+import pandas as pd
+import numpy as np
+import os
+from pathlib import Path
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import gc
+
+# ==============================================================================
+# CONFIGURAÇÕES
+# ==============================================================================
+OUT_FINAL = Path("/content/drive/MyDrive/GEE_Mestrado/PARQUET/SAIDA_FINAL")
+ARQUIVO_RESUMO = OUT_FINAL / "RESUMO_VALIDACAO_LST.csv"
+
+print(f"📂 Varrendo microrregiões em: {OUT_FINAL}")
+
+# ==============================================================================
+# FUNÇÃO DE VALIDAÇÃO (HOLD-OUT)
+# ==============================================================================
+def validar_micro(pasta_micro):
+    # Pega o primeiro arquivo parcial encontrado (amostra suficiente)
+    arquivo = next(pasta_micro.glob("part_*.parquet"), None)
+
+    if not arquivo:
+        return None
+
+    # Carrega dados
+    df = pd.read_parquet(arquivo)
+
+    # --- 1. PREPARAR O TESTE ---
+    # Filtra apenas dados reais
+    mask_reais = df["lst"].notna()
+    indices_reais = df[mask_reais].index
+
+    if len(indices_reais) < 100:
+        return None # Poucos dados para validar
+
+    # Sorteia 20% para esconder
+    np.random.seed(42)
+    indices_escondidos = np.random.choice(indices_reais, size=int(len(indices_reais) * 0.2), replace=False)
+
+    # Cria coluna de teste com buracos
+    df["lst_teste"] = df["lst"].copy()
+    df.loc[indices_escondidos, "lst_teste"] = np.nan
+
+    # --- 2. INTERPOLAR ---
+    # Ordena por espaço e tempo
+    df = df.sort_values(["latitude", "longitude", "data"])
+
+    # Interpolação Linear (a mesma usada na produção)
+    df["lst_reconstruido"] = df.groupby(["latitude", "longitude"])["lst_teste"].transform(
+        lambda x: x.interpolate(method="linear", limit=32)
+    )
+
+    # --- 3. CALCULAR MÉTRICAS ---
+    # Filtra apenas os escondidos
+    df_val = df.loc[indices_escondidos].dropna(subset=["lst", "lst_reconstruido"])
+
+    if df_val.empty:
+        return None
+
+    y_real = df_val["lst"]
+    y_est = df_val["lst_reconstruido"]
+
+    return {
+        "Microrregiao": pasta_micro.name,
+        "MAE": mean_absolute_error(y_real, y_est),
+        "RMSE": np.sqrt(mean_squared_error(y_real, y_est)),
+        "r": y_real.corr(y_est),
+        "N_Amostras": len(y_real)
+    }
+
+# ==============================================================================
+# EXECUÇÃO EM LOOP
+# ==============================================================================
+resultados = []
+pastas = [p for p in OUT_FINAL.iterdir() if p.is_dir()]
+
+print(f"📋 Encontradas {len(pastas)} pastas.")
+
+for i, pasta in enumerate(sorted(pastas)):
+    print(f"[{i+1}/{len(pastas)}] Validando: {pasta.name}...", end=" ")
+
+    try:
+        res = validar_micro(pasta)
+
+        if res:
+            resultados.append(res)
+            print(f"✔ (MAE: {res['MAE']:.2f} | RMSE: {res['RMSE']:.2f})")
+        else:
+            print("⚠ (Dados insuficientes ou arquivo vazio)")
+
+    except Exception as e:
+        print(f"❌ Erro: {e}")
+
+    gc.collect()
+
+# ==============================================================================
+# SALVAR E MOSTRAR
+# ==============================================================================
+if resultados:
+    df_resumo = pd.DataFrame(resultados).sort_values("MAE")
+
+    # Salva CSV
+    df_resumo.to_csv(ARQUIVO_RESUMO, index=False)
+
+    print("\n" + "="*60)
+    print(" RESUMO GERAL DA VALIDAÇÃO (TOP 5 MELHORES)")
+    print("="*60)
+    print(df_resumo.head(5).to_string(index=False))
+
+    print("\n" + "="*60)
+    print("MÉDIAS GLOBAIS:")
+    print(f"MAE Médio:  {df_resumo['MAE'].mean():.2f} °C")
+    print(f"RMSE Médio: {df_resumo['RMSE'].mean():.2f} °C")
+    print(f"Corr. Média: {df_resumo['r'].mean():.4f}")
+    print("="*60)
+    print(f" Tabela completa salva em: {ARQUIVO_RESUMO}")
+else:
+    print("\n Nenhum resultado gerado.")
